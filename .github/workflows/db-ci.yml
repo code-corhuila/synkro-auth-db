@@ -1,0 +1,127 @@
+name: db-ci
+
+on:
+  push:
+    branches: [develop, qa, main]
+  pull_request:
+    branches: [develop, qa, main]
+
+jobs:
+  migration-rebuild:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: ci_admin_pw
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      FLYWAY_URL: jdbc:postgresql://localhost:5432/postgres
+      FLYWAY_USER: postgres
+      FLYWAY_PASSWORD: ci_admin_pw
+      PGPASSWORD: ci_admin_pw
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install psql
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Simulate bootstrap — create the auth_app login role
+        # The real bootstrap script lives in synkro-infra-postgres
+        # (ADR-012 Decision 1), not built yet. This step stands in for it,
+        # in CI only. It is NOT how production bootstrap actually works —
+        # do not copy this step's approach into real infrastructure code.
+        run: |
+          psql -h localhost -U postgres -c \
+            "CREATE ROLE auth_app LOGIN PASSWORD 'ci_app_pw';"
+
+      - name: Install Flyway — the same image deploy/compose.yml runs
+        # Flyway stopped publishing the CLI tarball to Maven Central after
+        # 11.8.x, so CI runs the official image through a thin wrapper.
+        # Keep this tag identical to deploy/compose.yml: CI must prove the
+        # exact runner that deploys.
+        run: |
+          docker pull flyway/flyway:11.20.3-alpine
+          # The repository is copied in with `docker cp` rather than
+          # bind-mounted, so the wrapper works whether or not the Docker
+          # daemon can see the job's filesystem (containerized runners, act).
+          sudo tee /usr/local/bin/flyway > /dev/null <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cid=$(docker create --network host \
+            -e FLYWAY_URL -e FLYWAY_USER -e FLYWAY_PASSWORD \
+            flyway/flyway:11.20.3-alpine -workingDirectory=/workspace "$@")
+          trap 'docker rm -f "$cid" > /dev/null' EXIT
+          docker cp -q "$PWD/." "$cid:/workspace"
+          docker start -a "$cid"
+          exit "$(docker inspect -f '{{.State.ExitCode}}' "$cid")"
+          SH
+          sudo chmod +x /usr/local/bin/flyway
+          flyway version
+
+      - name: Migrate from empty — every V migration must be applied
+        # A missing config or location makes Flyway "succeed" with zero
+        # migrations, so success alone proves nothing: count them.
+        run: |
+          flyway -configFiles=flyway.toml migrate
+          expected=$(find 01_ddl 02_dml 03_dcl 04_tcl -name 'V*.sql' | wc -l)
+          applied=$(psql -h localhost -U postgres -d postgres -tAc \
+            "SELECT count(*) FROM flyway_schema_history WHERE success AND version IS NOT NULL;")
+          echo "V migrations in repository: $expected, applied: $applied"
+          if [ "$expected" -eq 0 ] || [ "$applied" != "$expected" ]; then
+            echo "Applied migrations do not match the repository"
+            exit 1
+          fi
+
+      - name: Migrate again — must report no migration necessary
+        run: |
+          output=$(flyway -configFiles=flyway.toml migrate)
+          echo "$output"
+          echo "$output" | grep -q "No migration necessary" \
+            || (echo "Second migrate was not a no-op" && exit 1)
+
+      - name: Privilege check — auth_app can use auth_schema
+        run: |
+          result=$(psql -h localhost -U postgres -d postgres -tAc \
+            "SELECT has_schema_privilege('auth_app', 'auth_schema', 'USAGE');")
+          if [ "$result" != "t" ]; then
+            echo "auth_app lacks USAGE on auth_schema"
+            exit 1
+          fi
+
+      - name: Apply rollbacks, highest version to lowest
+        run: |
+          set -euo pipefail
+          find 05_rollbacks -name 'U*.sql' -printf '%f\t%p\n' \
+            | sort -r \
+            | cut -f2 \
+            | while read -r f; do
+                echo "Applying $f"
+                psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -f "$f"
+              done
+
+      - name: Confirm auth_schema and auth_writer no longer exist
+        run: |
+          result=$(psql -h localhost -U postgres -d postgres -tAc \
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = 'auth_schema';")
+          if [ -n "$result" ]; then
+            echo "auth_schema still exists after applying all rollbacks"
+            exit 1
+          fi
+          result=$(psql -h localhost -U postgres -d postgres -tAc \
+            "SELECT 1 FROM pg_roles WHERE rolname = 'auth_writer';")
+          if [ -n "$result" ]; then
+            echo "auth_writer still exists after applying all rollbacks"
+            exit 1
+          fi
+
+      - name: Drop flyway_schema_history and migrate again
+        run: |
+          psql -h localhost -U postgres -d postgres -c \
+            "DROP TABLE IF EXISTS flyway_schema_history;"
+          flyway -configFiles=flyway.toml migrate

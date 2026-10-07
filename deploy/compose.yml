@@ -1,0 +1,18 @@
+name: synkro-auth-db
+
+services:
+  auth-db-migrate:
+    image: flyway/flyway:11.20.3-alpine
+    profiles: [tooling]
+    environment:
+      FLYWAY_URL: ${FLYWAY_URL:?set FLYWAY_URL - see .env.example}
+      FLYWAY_USER: ${FLYWAY_USER:?set FLYWAY_USER - see .env.example}
+      FLYWAY_PASSWORD: ${FLYWAY_PASSWORD:?set FLYWAY_PASSWORD - see .env.example}
+    volumes: ["../:/workspace:ro"]
+    entrypoint: ["flyway", "-workingDirectory=/workspace", "-configFiles=flyway.toml"]
+    command: ["migrate"]
+    networks: [platform]
+
+networks:
+  platform:
+    external: true
