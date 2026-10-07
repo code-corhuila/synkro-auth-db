@@ -1,0 +1,4 @@
+REVOKE auth_writer FROM auth_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA auth_schema
+  REVOKE SELECT, INSERT, UPDATE ON TABLES FROM auth_writer;
+REVOKE USAGE ON SCHEMA auth_schema FROM auth_writer;
