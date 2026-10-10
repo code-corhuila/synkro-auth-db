@@ -58,6 +58,9 @@ Rules every new migration follows:
   PRIVILEGES`, which covers only tables created by the role that ran them. The runner always
   connects as the instance administrator, so every table is created by that same role; the CI
   checks that a table's owner is the role that set those defaults.
+- **A foreign key is its own migration in `04_alter/`, and its column gets an index.** The `CREATE
+  TABLE` never holds a foreign key, so the order in which tables are created does not matter. The CI
+  checks every foreign key of the schema for an index, including the keys added later.
 
 ## Schema, tables and roles
 
@@ -67,6 +70,7 @@ Rules every new migration follows:
 | `auth_writer` (`NOLOGIN`) | `V002` | `USAGE` on `auth_schema`; `SELECT`, `INSERT`, `UPDATE` on its tables, never `DELETE`. Granted to `auth_app`. |
 | `auth_reader` (`NOLOGIN`) | `V004` | `USAGE` on `auth_schema`; `SELECT` on its tables. Not granted to `auth_app`: no service reads through it yet. |
 | `auth_schema.system_user` | `V006` | the users of the system. `role` is `ADMIN`, `SALESPERSON` or `INVENTORY`; `SERVICE` is never a user role (ADR-006). No foreign keys. |
+| `auth_schema.refresh_token` | `V007`, key `V008`, index `V009` | the refresh tokens. `token` holds a hash, never the token. `user_id` references `system_user` with `fk_refresh_token_user`, `ON DELETE RESTRICT`, indexed by `idx_refresh_token_user_id`. Tokens are deactivated (`active = false`), never deleted. |
 
 ## Running the migrations locally
 
@@ -124,12 +128,17 @@ It proves, in order:
 3. **Privileges:** `auth_app` has `USAGE` on `auth_schema`, and `SELECT`, `INSERT`, `UPDATE` on
    `system_user` but not `DELETE`, which it inherits from `auth_writer`. `auth_reader` can read
    `system_user` and cannot insert into it.
-4. **Constraints:** every CHECK, unique and NOT NULL rule of `system_user` rejects its bad rows with
-   the expected SQLSTATE and constraint (or column) name, and accepts the valid rows next to them.
-   The step deletes the rows it inserts.
-5. **Rollbacks** apply cleanly, highest version to lowest, and leave none of `auth_schema`,
+4. **Constraints:** every CHECK, unique, foreign key and NOT NULL rule of `system_user` and
+   `refresh_token` rejects its bad rows with the expected SQLSTATE and constraint (or column) name,
+   and accepts the valid rows next to them. The steps delete the rows they insert, children first.
+5. **Indexes:** `idx_refresh_token_user_id` exists on `user_id`, and every foreign key of
+   `auth_schema` has an index that starts with its column.
+6. **Rollbacks** apply cleanly, highest version to lowest, and leave none of `auth_schema`,
    `auth_writer` or `auth_reader` behind.
-6. **Rebuild:** after dropping `flyway_schema_history`, migrating from scratch succeeds again.
+7. **Rebuild:** after dropping `flyway_schema_history`, migrating from scratch succeeds again.
+
+The assertions live in [`.github/scripts/db-checks.sh`](.github/scripts/db-checks.sh); each check step
+sources it from the repository root.
 
 To reproduce it by hand against the stand-in database above (bash, repository root):
 
@@ -145,7 +154,7 @@ find 05_rollbacks -name 'U*.sql' -printf '%f\t%p\n' | sort -r | cut -f2 | while 
 docker exec synkro-db psql -U postgres -d synkro -c "DROP TABLE IF EXISTS flyway_schema_history;"
 ```
 
-Then migrate again (step 3 above). The first command must print `t`; the loop must apply `U006`
+Then migrate again (step 3 above). The first command must print `t`; the loop must apply `U009`
 down to `U001`, in that order, without errors.
 
 To run the whole workflow locally, unchanged, use [`act`](https://github.com/nektos/act):
