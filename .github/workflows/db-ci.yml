@@ -340,6 +340,248 @@ jobs:
             "SELECT coalesce(string_agg(c.conname, ', ' ORDER BY c.conname), '') FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'f' AND n.nspname = 'auth_schema' AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.conrelid AND i.indkey[0] = c.conkey[1]);" \
             ""
 
+      - name: Privilege check — service_token grants for auth_app, auth_writer and auth_reader
+        # Same grants as refresh_token: auth_app reaches the table through auth_writer,
+        # and nobody holds DELETE. A service token's metadata is kept, never removed.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          expect_eq "service_token exists in auth_schema" \
+            "SELECT to_regclass('auth_schema.service_token') IS NOT NULL;" t
+          expect_eq "auth_app can SELECT service_token" \
+            "SELECT has_table_privilege('auth_app', 'auth_schema.service_token', 'SELECT');" t
+          expect_eq "auth_app can INSERT service_token" \
+            "SELECT has_table_privilege('auth_app', 'auth_schema.service_token', 'INSERT');" t
+          expect_eq "auth_app can UPDATE service_token" \
+            "SELECT has_table_privilege('auth_app', 'auth_schema.service_token', 'UPDATE');" t
+          expect_eq "auth_app cannot DELETE service_token" \
+            "SELECT has_table_privilege('auth_app', 'auth_schema.service_token', 'DELETE');" f
+          expect_eq "auth_app has no direct grant on service_token" \
+            "SELECT count(*) FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE c.oid = 'auth_schema.service_token'::regclass AND r.rolname = 'auth_app';" 0
+          expect_eq "auth_writer cannot DELETE service_token" \
+            "SELECT has_table_privilege('auth_writer', 'auth_schema.service_token', 'DELETE');" f
+          expect_eq "auth_reader can SELECT service_token" \
+            "SELECT has_table_privilege('auth_reader', 'auth_schema.service_token', 'SELECT');" t
+          expect_eq "auth_reader cannot INSERT service_token" \
+            "SELECT has_table_privilege('auth_reader', 'auth_schema.service_token', 'INSERT');" f
+          expect_eq "the role that owns service_token also set auth_schema's default privileges" \
+            "SELECT pg_get_userbyid(c.relowner) = pg_get_userbyid(d.defaclrole) FROM pg_class c, pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace WHERE c.oid = 'auth_schema.service_token'::regclass AND n.nspname = 'auth_schema' AND d.defaclobjtype = 'r';" t
+
+      - name: Constraint checks — service_token rejects bad rows and is cleaned up
+        # Each rejection carries its SQLSTATE and the constraint or column it breaks,
+        # next to a valid control. Placeholder data only: no real token or hash here.
+        # The issuer is an ADMIN this step creates, and deletes after its tokens.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          expect_accepted "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES ('Sia Service', 'service-issuer@synkro.test', 'placeholder-not-a-hash', 'ADMIN');" \
+            "an ADMIN to issue the tokens"
+
+          # token_id has no default: it is the jti that the domain generates.
+          # issued_at keeps its default in these two rows.
+          expect_accepted "INSERT INTO auth_schema.service_token (token_id, service, permissions, issued_by, expires_at) SELECT gen_random_uuid(), 'synkro-workflow', ARRAY['customers:read', 'stock:reserve', 'stock:release', 'sales:register'], user_id, now() + interval '30 days' FROM auth_schema.system_user WHERE email = 'service-issuer@synkro.test';" \
+            "a token for synkro-workflow, issued by an ADMIN"
+          expect_accepted "INSERT INTO auth_schema.service_token (token_id, service, permissions, issued_by, expires_at) SELECT gen_random_uuid(), 'synkro-worker', ARRAY['products:read', 'stock-alerts:read', 'stock-alerts:write'], user_id, now() + interval '30 days' FROM auth_schema.system_user WHERE email = 'service-issuer@synkro.test';" \
+            "a token for synkro-worker, issued by an ADMIN"
+          expect_eq "defaults are generated: issued_at is set to now" \
+            "SELECT count(*) FROM auth_schema.service_token WHERE issued_at > now() - interval '1 minute';" 2
+
+          expect_violation 23514 chk_service_token_service \
+            "INSERT INTO auth_schema.service_token (token_id, service, permissions, issued_by, expires_at) SELECT gen_random_uuid(), 'synkro-sales-api', ARRAY['sales:register'], user_id, now() + interval '30 days' FROM auth_schema.system_user WHERE email = 'service-issuer@synkro.test';"
+
+          expect_violation 23514 chk_service_token_expiry \
+            "INSERT INTO auth_schema.service_token (token_id, service, permissions, issued_by, issued_at, expires_at) SELECT gen_random_uuid(), 'synkro-worker', ARRAY['products:read'], user_id, now(), now() FROM auth_schema.system_user WHERE email = 'service-issuer@synkro.test';"
+          expect_violation 23514 chk_service_token_expiry \
+            "INSERT INTO auth_schema.service_token (token_id, service, permissions, issued_by, issued_at, expires_at) SELECT gen_random_uuid(), 'synkro-worker', ARRAY['products:read'], user_id, now(), now() - interval '1 second' FROM auth_schema.system_user WHERE email = 'service-issuer@synkro.test';"
+          expect_accepted "INSERT INTO auth_schema.service_token (token_id, service, permissions, issued_by, issued_at, expires_at) SELECT gen_random_uuid(), 'synkro-worker', ARRAY['products:read'], user_id, now(), now() + interval '1 day' FROM auth_schema.system_user WHERE email = 'service-issuer@synkro.test';" \
+            "an expiry one day after the issue"
+
+          expect_violation 23502 token_id \
+            "INSERT INTO auth_schema.service_token (service, permissions, issued_by, expires_at) SELECT 'synkro-worker', ARRAY['products:read'], user_id, now() + interval '30 days' FROM auth_schema.system_user WHERE email = 'service-issuer@synkro.test';"
+
+          # Every required column rejects NULL: SQLSTATE 23502, named by its column
+          declare -A VALUE=(
+            [token_id]="gen_random_uuid()"
+            [service]="'synkro-workflow'"
+            [permissions]="ARRAY['customers:read']"
+            [issued_by]="(SELECT user_id FROM auth_schema.system_user WHERE email = 'service-issuer@synkro.test')"
+            [expires_at]="now() + interval '30 days'"
+          )
+          columns="token_id, service, permissions, issued_by, expires_at"
+          for null_column in token_id service permissions issued_by expires_at; do
+            values=""
+            for column in token_id service permissions issued_by expires_at; do
+              value="${VALUE[$column]}"
+              if [ "$column" = "$null_column" ]; then value="NULL"; fi
+              values+="${values:+, }$value"
+            done
+            expect_violation 23502 "$null_column" \
+              "INSERT INTO auth_schema.service_token ($columns) VALUES ($values);"
+          done
+
+          # A repeated token_id is the same jti: the primary key refuses it
+          expect_violation 23505 pk_service_token \
+            "INSERT INTO auth_schema.service_token (token_id, service, permissions, issued_by, expires_at) SELECT token_id, 'synkro-worker', ARRAY['products:read'], issued_by, now() + interval '30 days' FROM auth_schema.service_token WHERE service = 'synkro-workflow' LIMIT 1;"
+
+          # Children before parents: the reverse order is refused once the foreign key exists
+          $PSQL -c "DELETE FROM auth_schema.service_token;"
+          $PSQL -c "DELETE FROM auth_schema.system_user;"
+          expect_eq "service_token is empty after the checks" \
+            "SELECT count(*) FROM auth_schema.service_token;" 0
+          expect_eq "system_user is empty after the checks" \
+            "SELECT count(*) FROM auth_schema.system_user;" 0
+
+      - name: Privilege check — idempotency_key grants for auth_app, auth_writer and auth_reader
+        # Same grants as the other tables: auth_app reaches the table through auth_writer,
+        # and nobody holds DELETE. A used key stays, so a retry can find it.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          expect_eq "idempotency_key exists in auth_schema" \
+            "SELECT to_regclass('auth_schema.idempotency_key') IS NOT NULL;" t
+          expect_eq "auth_app can SELECT idempotency_key" \
+            "SELECT has_table_privilege('auth_app', 'auth_schema.idempotency_key', 'SELECT');" t
+          expect_eq "auth_app can INSERT idempotency_key" \
+            "SELECT has_table_privilege('auth_app', 'auth_schema.idempotency_key', 'INSERT');" t
+          expect_eq "auth_app can UPDATE idempotency_key" \
+            "SELECT has_table_privilege('auth_app', 'auth_schema.idempotency_key', 'UPDATE');" t
+          expect_eq "auth_app cannot DELETE idempotency_key" \
+            "SELECT has_table_privilege('auth_app', 'auth_schema.idempotency_key', 'DELETE');" f
+          expect_eq "auth_app has no direct grant on idempotency_key" \
+            "SELECT count(*) FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE c.oid = 'auth_schema.idempotency_key'::regclass AND r.rolname = 'auth_app';" 0
+          expect_eq "auth_writer cannot DELETE idempotency_key" \
+            "SELECT has_table_privilege('auth_writer', 'auth_schema.idempotency_key', 'DELETE');" f
+          expect_eq "auth_reader can SELECT idempotency_key" \
+            "SELECT has_table_privilege('auth_reader', 'auth_schema.idempotency_key', 'SELECT');" t
+          expect_eq "auth_reader cannot INSERT idempotency_key" \
+            "SELECT has_table_privilege('auth_reader', 'auth_schema.idempotency_key', 'INSERT');" f
+          expect_eq "the role that owns idempotency_key also set auth_schema's default privileges" \
+            "SELECT pg_get_userbyid(c.relowner) = pg_get_userbyid(d.defaclrole) FROM pg_class c, pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace WHERE c.oid = 'auth_schema.idempotency_key'::regclass AND n.nspname = 'auth_schema' AND d.defaclobjtype = 'r';" t
+
+      - name: Constraint checks — idempotency_key rejects bad keys and is cleaned up
+        # Each rejection carries its SQLSTATE and the constraint or column it breaks,
+        # next to a valid control. Placeholder keys only: they are not secrets.
+        # The table has no foreign key: resource_id names a user or a token by type,
+        # so the rows of this step need no parent row.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          expect_eq "idempotency_key has no foreign key" \
+            "SELECT count(*) FROM pg_constraint WHERE conrelid = 'auth_schema.idempotency_key'::regclass AND contype = 'f';" 0
+
+          expect_accepted "INSERT INTO auth_schema.idempotency_key (key, resource_type, resource_id) VALUES (repeat('a', 8), 'USER', gen_random_uuid());" \
+            "a key of 8 characters for a USER"
+          expect_accepted "INSERT INTO auth_schema.idempotency_key (key, resource_type, resource_id) VALUES (repeat('b', 128), 'SERVICE_TOKEN', gen_random_uuid());" \
+            "a key of 128 characters for a SERVICE_TOKEN"
+          expect_eq "defaults are generated: created_at is set to now" \
+            "SELECT count(*) FROM auth_schema.idempotency_key WHERE created_at > now() - interval '1 minute';" 2
+
+          expect_violation 23514 chk_idempotency_key_length \
+            "INSERT INTO auth_schema.idempotency_key (key, resource_type, resource_id) VALUES (repeat('c', 7), 'USER', gen_random_uuid());"
+          expect_violation 23514 chk_idempotency_key_length \
+            "INSERT INTO auth_schema.idempotency_key (key, resource_type, resource_id) VALUES (repeat('d', 129), 'SERVICE_TOKEN', gen_random_uuid());"
+
+          expect_violation 23514 chk_idempotency_key_resource_type \
+            "INSERT INTO auth_schema.idempotency_key (key, resource_type, resource_id) VALUES (repeat('e', 8), 'SERVICE', gen_random_uuid());"
+
+          # A repeated key is refused: the key is the primary key
+          expect_violation 23505 pk_idempotency_key \
+            "INSERT INTO auth_schema.idempotency_key (key, resource_type, resource_id) VALUES (repeat('a', 8), 'USER', gen_random_uuid());"
+
+          # Every required column rejects NULL: SQLSTATE 23502, named by its column
+          declare -A VALUE=(
+            [key]="repeat('f', 8)"
+            [resource_type]="'USER'"
+            [resource_id]="gen_random_uuid()"
+          )
+          columns="key, resource_type, resource_id"
+          for null_column in key resource_type resource_id; do
+            values=""
+            for column in key resource_type resource_id; do
+              value="${VALUE[$column]}"
+              if [ "$column" = "$null_column" ]; then value="NULL"; fi
+              values+="${values:+, }$value"
+            done
+            expect_violation 23502 "$null_column" \
+              "INSERT INTO auth_schema.idempotency_key ($columns) VALUES ($values);"
+          done
+
+          # Clean up every row this step accepted
+          $PSQL -c "DELETE FROM auth_schema.idempotency_key;"
+          expect_eq "idempotency_key is empty after the checks" \
+            "SELECT count(*) FROM auth_schema.idempotency_key;" 0
+
+      - name: Constraint checks — service_token issuer foreign key is enforced
+        # The issuer must exist, and an ADMIN who issued a token cannot be deleted
+        # while the token exists: RESTRICT, not CASCADE. Placeholder data only.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          expect_accepted "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES ('Fay Foreign', 'fk-issuer@synkro.test', 'placeholder-not-a-hash', 'ADMIN');" \
+            "an ADMIN who will issue a token"
+          expect_accepted "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES ('Ivo Idle', 'fk-idle@synkro.test', 'placeholder-not-a-hash', 'INVENTORY');" \
+            "a user that issues no token"
+          expect_accepted "INSERT INTO auth_schema.service_token (token_id, service, permissions, issued_by, expires_at) SELECT gen_random_uuid(), 'synkro-workflow', ARRAY['sales:register'], user_id, now() + interval '30 days' FROM auth_schema.system_user WHERE email = 'fk-issuer@synkro.test';" \
+            "a token issued by an existing ADMIN"
+
+          expect_violation 23503 fk_service_token_issued_by \
+            "INSERT INTO auth_schema.service_token (token_id, service, permissions, issued_by, expires_at) VALUES (gen_random_uuid(), 'synkro-worker', ARRAY['products:read'], '99999999-9999-9999-9999-999999999999', now() + interval '30 days');"
+          expect_violation 23503 fk_service_token_issued_by \
+            "DELETE FROM auth_schema.system_user WHERE email = 'fk-issuer@synkro.test';"
+          expect_accepted "DELETE FROM auth_schema.system_user WHERE email = 'fk-idle@synkro.test';" \
+            "deleting a user that issued no token"
+
+          # Children before parents: the foreign key forbids the reverse order
+          $PSQL -c "DELETE FROM auth_schema.service_token;"
+          $PSQL -c "DELETE FROM auth_schema.system_user;"
+          expect_eq "service_token is empty after the checks" \
+            "SELECT count(*) FROM auth_schema.service_token;" 0
+          expect_eq "system_user is empty after the checks" \
+            "SELECT count(*) FROM auth_schema.system_user;" 0
+
+      - name: Index check — service_token is indexed by its issuer
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          expect_eq "idx_service_token_issued_by is on service_token (issued_by)" \
+            "SELECT coalesce(pg_get_indexdef(to_regclass('auth_schema.idx_service_token_issued_by')), '<none>');" \
+            "CREATE INDEX idx_service_token_issued_by ON auth_schema.service_token USING btree (issued_by)"
+
+      - name: Privilege check — auth_app cannot DELETE from any table of auth_schema
+        # Schema-wide: the query reads the ordinary tables of auth_schema from the catalog,
+        # so a table added later is checked without editing this step. has_table_privilege
+        # counts grants inherited through auth_writer and PUBLIC, which aclexplode does not.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          # Without this guard the next check passes when the schema has no table at all
+          expect_eq "auth_schema has tables to check" \
+            "SELECT count(*) > 0 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'auth_schema' AND c.relkind = 'r';" t
+          expect_eq "auth_app cannot DELETE from any table of auth_schema" \
+            "SELECT coalesce(string_agg(c.relname, ', ' ORDER BY c.relname), '') FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'auth_schema' AND c.relkind = 'r' AND has_table_privilege('auth_app', c.oid, 'DELETE');" \
+            ""
+
       - name: Apply rollbacks, highest version to lowest
         run: |
           set -euo pipefail

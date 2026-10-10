@@ -1,0 +1,4 @@
+# The CI runs these files on Linux. They keep LF endings whatever the client's
+# core.autocrlf says: a CRLF db-checks.sh would fail on the first line of CI.
+*.sh text eol=lf
+*.sql text eol=lf
