@@ -64,6 +64,8 @@ Rules every new migration follows:
 
 ## Schema, tables and roles
 
+This repository holds the complete `auth` model of `06-data/models.md` in `synkro-docs`: one schema, four tables and two roles.
+
 | Object | Created by | What it grants |
 |---|---|---|
 | `auth_schema` | `V001` | the schema of this domain |
@@ -71,6 +73,8 @@ Rules every new migration follows:
 | `auth_reader` (`NOLOGIN`) | `V004` | `USAGE` on `auth_schema`; `SELECT` on its tables. Not granted to `auth_app`: no service reads through it yet. |
 | `auth_schema.system_user` | `V006` | the users of the system. `role` is `ADMIN`, `SALESPERSON` or `INVENTORY`; `SERVICE` is never a user role (ADR-006). No foreign keys. |
 | `auth_schema.refresh_token` | `V007`, key `V008`, index `V009` | the refresh tokens. `token` holds a hash, never the token. `user_id` references `system_user` with `fk_refresh_token_user`, `ON DELETE RESTRICT`, indexed by `idx_refresh_token_user_id`. Tokens are deactivated (`active = false`), never deleted. |
+| `auth_schema.service_token` | `V010`, key `V012`, index `V013` | the metadata of the tokens that `synkro-workflow` and `synkro-worker` use to call other services (ADR-006). The signed token is never stored. `issued_by` references `system_user` with `fk_service_token_issued_by`, `ON DELETE RESTRICT`, indexed by `idx_service_token_issued_by`. Tokens are never deleted. |
+| `auth_schema.idempotency_key` | `V011` | the `Idempotency-Key` of each creation: user registration and service-token issuance. `key` is the primary key. `resource_id` names a user or a token depending on `resource_type`, so it has no foreign key. |
 
 ## Running the migrations locally
 
@@ -125,14 +129,17 @@ It proves, in order:
 1. **Migrate from empty** applies every `V*.sql` in the repository (the applied count is checked:
    Flyway exits 0 with zero migrations when it cannot find its config).
 2. **Migrate again** is a no-op (`No migration necessary`).
-3. **Privileges:** `auth_app` has `USAGE` on `auth_schema`, and `SELECT`, `INSERT`, `UPDATE` on
-   `system_user` but not `DELETE`, which it inherits from `auth_writer`. `auth_reader` can read
-   `system_user` and cannot insert into it.
-4. **Constraints:** every CHECK, unique, foreign key and NOT NULL rule of `system_user` and
-   `refresh_token` rejects its bad rows with the expected SQLSTATE and constraint (or column) name,
-   and accepts the valid rows next to them. The steps delete the rows they insert, children first.
-5. **Indexes:** `idx_refresh_token_user_id` exists on `user_id`, and every foreign key of
-   `auth_schema` has an index that starts with its column.
+3. **Privileges:** `auth_app` has `USAGE` on `auth_schema`, and on each of the four tables
+   `SELECT`, `INSERT` and `UPDATE` but never `DELETE`, which it inherits from `auth_writer`.
+   `auth_reader` can read the tables and cannot insert into them. `auth_app` cannot delete from
+   any table of `auth_schema`, including one added later.
+4. **Constraints:** every CHECK, unique, foreign key and NOT NULL rule of `system_user`,
+   `refresh_token`, `service_token` and `idempotency_key` rejects its bad rows with the expected
+   SQLSTATE and constraint (or column) name, and accepts the valid rows next to them. The steps
+   delete the rows they insert, children first.
+5. **Indexes:** `idx_refresh_token_user_id` and `idx_service_token_issued_by` exist on their
+   `user_id` and `issued_by` columns, and every foreign key of `auth_schema` has an index that
+   starts with its column.
 6. **Rollbacks** apply cleanly, highest version to lowest, and leave none of `auth_schema`,
    `auth_writer` or `auth_reader` behind.
 7. **Rebuild:** after dropping `flyway_schema_history`, migrating from scratch succeeds again.
