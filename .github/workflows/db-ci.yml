@@ -302,6 +302,16 @@ jobs:
               "INSERT INTO auth_schema.refresh_token ($columns) VALUES ($values);"
           done
 
+          # The owner must exist; a user that owns a token cannot be deleted
+          expect_violation 23503 fk_refresh_token_user \
+            "INSERT INTO auth_schema.refresh_token (user_id, token, expiration_date) VALUES ('99999999-9999-9999-9999-999999999999', 'placeholder-token-hash-4', now() + interval '7 days');"
+          expect_accepted "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES ('Idle User', 'idle@synkro.test', 'placeholder-not-a-hash', 'INVENTORY');" \
+            "a user that owns no token"
+          expect_violation 23503 fk_refresh_token_user \
+            "DELETE FROM auth_schema.system_user WHERE email = 'token-owner@synkro.test';"
+          expect_accepted "DELETE FROM auth_schema.system_user WHERE email = 'idle@synkro.test';" \
+            "deleting a user that owns no token"
+
           # Children before parents: the foreign key forbids the reverse order
           $PSQL -c "DELETE FROM auth_schema.refresh_token;"
           $PSQL -c "DELETE FROM auth_schema.system_user;"
