@@ -523,6 +523,48 @@ jobs:
           expect_eq "idempotency_key is empty after the checks" \
             "SELECT count(*) FROM auth_schema.idempotency_key;" 0
 
+      - name: Constraint checks — service_token issuer foreign key is enforced
+        # The issuer must exist, and an ADMIN who issued a token cannot be deleted
+        # while the token exists: RESTRICT, not CASCADE. Placeholder data only.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          expect_accepted "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES ('Fay Foreign', 'fk-issuer@synkro.test', 'placeholder-not-a-hash', 'ADMIN');" \
+            "an ADMIN who will issue a token"
+          expect_accepted "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES ('Ivo Idle', 'fk-idle@synkro.test', 'placeholder-not-a-hash', 'INVENTORY');" \
+            "a user that issues no token"
+          expect_accepted "INSERT INTO auth_schema.service_token (token_id, service, permissions, issued_by, expires_at) SELECT gen_random_uuid(), 'synkro-workflow', ARRAY['sales:register'], user_id, now() + interval '30 days' FROM auth_schema.system_user WHERE email = 'fk-issuer@synkro.test';" \
+            "a token issued by an existing ADMIN"
+
+          expect_violation 23503 fk_service_token_issued_by \
+            "INSERT INTO auth_schema.service_token (token_id, service, permissions, issued_by, expires_at) VALUES (gen_random_uuid(), 'synkro-worker', ARRAY['products:read'], '99999999-9999-9999-9999-999999999999', now() + interval '30 days');"
+          expect_violation 23503 fk_service_token_issued_by \
+            "DELETE FROM auth_schema.system_user WHERE email = 'fk-issuer@synkro.test';"
+          expect_accepted "DELETE FROM auth_schema.system_user WHERE email = 'fk-idle@synkro.test';" \
+            "deleting a user that issued no token"
+
+          # Children before parents: the foreign key forbids the reverse order
+          $PSQL -c "DELETE FROM auth_schema.service_token;"
+          $PSQL -c "DELETE FROM auth_schema.system_user;"
+          expect_eq "service_token is empty after the checks" \
+            "SELECT count(*) FROM auth_schema.service_token;" 0
+          expect_eq "system_user is empty after the checks" \
+            "SELECT count(*) FROM auth_schema.system_user;" 0
+
+      - name: Index check — service_token is indexed by its issuer
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          expect_eq "idx_service_token_issued_by is on service_token (issued_by)" \
+            "SELECT coalesce(pg_get_indexdef(to_regclass('auth_schema.idx_service_token_issued_by')), '<none>');" \
+            "CREATE INDEX idx_service_token_issued_by ON auth_schema.service_token USING btree (issued_by)"
+
       - name: Apply rollbacks, highest version to lowest
         run: |
           set -euo pipefail
