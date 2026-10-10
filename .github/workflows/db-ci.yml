@@ -104,15 +104,7 @@ jobs:
           # -q drops the command tags (SET, DROP ...) that would pollute a value
           PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
 
-          # $1 = description, $2 = SQL returning one value, $3 = expected value
-          expect_eq() {
-            local got
-            got=$($PSQL -tAc "$2" 2>&1 || true)
-            if [ "$got" != "$3" ]; then
-              echo "FAIL: $1: expected '$3', got '$got'"; exit 1
-            fi
-            echo "PASS: $1"
-          }
+          source .github/scripts/db-checks.sh
 
           expect_eq "auth_reader exists" \
             "SELECT count(*) FROM pg_roles WHERE rolname = 'auth_reader';" 1
@@ -144,15 +136,7 @@ jobs:
           set -euo pipefail
           PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
 
-          # $1 = description, $2 = SQL returning one value, $3 = expected value
-          expect_eq() {
-            local got
-            got=$($PSQL -tAc "$2" 2>&1 || true)
-            if [ "$got" != "$3" ]; then
-              echo "FAIL: $1: expected '$3', got '$got'"; exit 1
-            fi
-            echo "PASS: $1"
-          }
+          source .github/scripts/db-checks.sh
 
           expect_eq "system_user exists in auth_schema" \
             "SELECT to_regclass('auth_schema.system_user') IS NOT NULL;" t
@@ -185,34 +169,7 @@ jobs:
           set -euo pipefail
           PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
 
-          # $1 = description, $2 = SQL returning one value, $3 = expected value
-          expect_eq() {
-            local got
-            got=$($PSQL -tAc "$2" 2>&1 || true)
-            if [ "$got" != "$3" ]; then
-              echo "FAIL: $1: expected '$3', got '$got'"; exit 1
-            fi
-            echo "PASS: $1"
-          }
-
-          # $1 = SQLSTATE, $2 = constraint or column name, $3 = SQL that must violate it
-          expect_violation() {
-            local out
-            if out=$($PSQL -v VERBOSITY=verbose -c "$3" 2>&1); then
-              echo "FAIL: accepted, expected $2 ($1) to reject: $3"; exit 1
-            fi
-            if ! grep -q "ERROR:  $1: .*\"$2\"" <<< "$out"; then
-              echo "FAIL: rejected for the wrong reason, expected $2 ($1), got:"
-              echo "$out"; exit 1
-            fi
-            echo "PASS: rejected by $2 ($1)"
-          }
-
-          # $1 = SQL that must succeed, $2 = what it proves
-          expect_accepted() {
-            $PSQL -c "$1" || { echo "FAIL: rejected a valid control: $2"; exit 1; }
-            echo "PASS: accepted (control): $2"
-          }
+          source .github/scripts/db-checks.sh
 
           expect_accepted "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES
             ('Ada Admin', 'admin@synkro.test', 'placeholder-not-a-hash', 'ADMIN'),
