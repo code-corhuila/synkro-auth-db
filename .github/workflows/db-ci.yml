@@ -94,6 +94,47 @@ jobs:
             exit 1
           fi
 
+      - name: Role check — auth_reader reads, cannot write, is not granted to auth_app
+        # auth_reader is deliberately not granted to auth_app: no service reads
+        # auth_schema through it yet. The probe table stands in for system_user,
+        # which V006 creates later, to prove V005's default SELECT reaches tables
+        # that the migration user creates in auth_schema.
+        run: |
+          set -euo pipefail
+          # -q drops the command tags (SET, DROP ...) that would pollute a value
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          # $1 = description, $2 = SQL returning one value, $3 = expected value
+          expect_eq() {
+            local got
+            got=$($PSQL -tAc "$2" 2>&1 || true)
+            if [ "$got" != "$3" ]; then
+              echo "FAIL: $1: expected '$3', got '$got'"; exit 1
+            fi
+            echo "PASS: $1"
+          }
+
+          expect_eq "auth_reader exists" \
+            "SELECT count(*) FROM pg_roles WHERE rolname = 'auth_reader';" 1
+          expect_eq "auth_reader is NOLOGIN" \
+            "SELECT rolcanlogin FROM pg_roles WHERE rolname = 'auth_reader';" f
+          expect_eq "auth_reader has USAGE on auth_schema" \
+            "SELECT has_schema_privilege('auth_reader', 'auth_schema', 'USAGE');" t
+          expect_eq "auth_app is not a member of auth_reader" \
+            "SELECT pg_has_role('auth_app', 'auth_reader', 'MEMBER');" f
+
+          $PSQL -c "CREATE TABLE auth_schema.probe_auth_reader (id integer);"
+          expect_eq "auth_reader can SELECT a table created in auth_schema" \
+            "SET ROLE auth_reader; SELECT count(*) FROM auth_schema.probe_auth_reader;" 0
+
+          out=$($PSQL -tAc "SET ROLE auth_reader; INSERT INTO auth_schema.probe_auth_reader VALUES (1);" 2>&1 || true)
+          if ! grep -q "permission denied for table probe_auth_reader" <<< "$out"; then
+            echo "FAIL: auth_reader must not INSERT, got:"; echo "$out"; exit 1
+          fi
+          echo "PASS: auth_reader cannot INSERT"
+
+          $PSQL -c "DROP TABLE auth_schema.probe_auth_reader;"
+
       - name: Apply rollbacks, highest version to lowest
         run: |
           set -euo pipefail
