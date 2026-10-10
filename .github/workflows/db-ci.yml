@@ -565,6 +565,23 @@ jobs:
             "SELECT coalesce(pg_get_indexdef(to_regclass('auth_schema.idx_service_token_issued_by')), '<none>');" \
             "CREATE INDEX idx_service_token_issued_by ON auth_schema.service_token USING btree (issued_by)"
 
+      - name: Privilege check — auth_app cannot DELETE from any table of auth_schema
+        # Schema-wide: the query reads the ordinary tables of auth_schema from the catalog,
+        # so a table added later is checked without editing this step. has_table_privilege
+        # counts grants inherited through auth_writer and PUBLIC, which aclexplode does not.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          # Without this guard the next check passes when the schema has no table at all
+          expect_eq "auth_schema has tables to check" \
+            "SELECT count(*) > 0 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'auth_schema' AND c.relkind = 'r';" t
+          expect_eq "auth_app cannot DELETE from any table of auth_schema" \
+            "SELECT coalesce(string_agg(c.relname, ', ' ORDER BY c.relname), '') FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'auth_schema' AND c.relkind = 'r' AND has_table_privilege('auth_app', c.oid, 'DELETE');" \
+            ""
+
       - name: Apply rollbacks, highest version to lowest
         run: |
           set -euo pipefail
