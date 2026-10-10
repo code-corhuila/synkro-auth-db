@@ -94,6 +94,187 @@ jobs:
             exit 1
           fi
 
+      - name: Role check — auth_reader reads, cannot write, is not granted to auth_app
+        # auth_reader is deliberately not granted to auth_app: no service reads
+        # auth_schema through it yet. The probe table stands in for system_user,
+        # which V006 creates later, to prove V005's default SELECT reaches tables
+        # that the migration user creates in auth_schema.
+        run: |
+          set -euo pipefail
+          # -q drops the command tags (SET, DROP ...) that would pollute a value
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          # $1 = description, $2 = SQL returning one value, $3 = expected value
+          expect_eq() {
+            local got
+            got=$($PSQL -tAc "$2" 2>&1 || true)
+            if [ "$got" != "$3" ]; then
+              echo "FAIL: $1: expected '$3', got '$got'"; exit 1
+            fi
+            echo "PASS: $1"
+          }
+
+          expect_eq "auth_reader exists" \
+            "SELECT count(*) FROM pg_roles WHERE rolname = 'auth_reader';" 1
+          expect_eq "auth_reader is NOLOGIN" \
+            "SELECT rolcanlogin FROM pg_roles WHERE rolname = 'auth_reader';" f
+          expect_eq "auth_reader has USAGE on auth_schema" \
+            "SELECT has_schema_privilege('auth_reader', 'auth_schema', 'USAGE');" t
+          expect_eq "auth_app is not a member of auth_reader" \
+            "SELECT pg_has_role('auth_app', 'auth_reader', 'MEMBER');" f
+
+          $PSQL -c "CREATE TABLE auth_schema.probe_auth_reader (id integer);"
+          expect_eq "auth_reader can SELECT a table created in auth_schema" \
+            "SET ROLE auth_reader; SELECT count(*) FROM auth_schema.probe_auth_reader;" 0
+
+          out=$($PSQL -tAc "SET ROLE auth_reader; INSERT INTO auth_schema.probe_auth_reader VALUES (1);" 2>&1 || true)
+          if ! grep -q "permission denied for table probe_auth_reader" <<< "$out"; then
+            echo "FAIL: auth_reader must not INSERT, got:"; echo "$out"; exit 1
+          fi
+          echo "PASS: auth_reader cannot INSERT"
+
+          $PSQL -c "DROP TABLE auth_schema.probe_auth_reader;"
+
+      - name: Privilege check — system_user grants for auth_app, auth_writer and auth_reader
+        # auth_app has no grant of its own on system_user: INSERT and UPDATE reach
+        # it through auth_writer, and nobody holds DELETE. The owner check proves
+        # that the role owning the table is the one that set auth_schema's default
+        # privileges (V003, V005), so a migration run by another role would fail here.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          # $1 = description, $2 = SQL returning one value, $3 = expected value
+          expect_eq() {
+            local got
+            got=$($PSQL -tAc "$2" 2>&1 || true)
+            if [ "$got" != "$3" ]; then
+              echo "FAIL: $1: expected '$3', got '$got'"; exit 1
+            fi
+            echo "PASS: $1"
+          }
+
+          expect_eq "system_user exists in auth_schema" \
+            "SELECT to_regclass('auth_schema.system_user') IS NOT NULL;" t
+          expect_eq "auth_app can SELECT system_user" \
+            "SELECT has_table_privilege('auth_app', 'auth_schema.system_user', 'SELECT');" t
+          expect_eq "auth_app can INSERT system_user" \
+            "SELECT has_table_privilege('auth_app', 'auth_schema.system_user', 'INSERT');" t
+          expect_eq "auth_app can UPDATE system_user" \
+            "SELECT has_table_privilege('auth_app', 'auth_schema.system_user', 'UPDATE');" t
+          expect_eq "auth_app cannot DELETE system_user" \
+            "SELECT has_table_privilege('auth_app', 'auth_schema.system_user', 'DELETE');" f
+          expect_eq "auth_app is a member of auth_writer" \
+            "SELECT pg_has_role('auth_app', 'auth_writer', 'MEMBER');" t
+          expect_eq "auth_app has no direct grant on system_user" \
+            "SELECT count(*) FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE c.oid = 'auth_schema.system_user'::regclass AND r.rolname = 'auth_app';" 0
+          expect_eq "auth_writer cannot DELETE system_user" \
+            "SELECT has_table_privilege('auth_writer', 'auth_schema.system_user', 'DELETE');" f
+          expect_eq "auth_reader can SELECT system_user" \
+            "SELECT has_table_privilege('auth_reader', 'auth_schema.system_user', 'SELECT');" t
+          expect_eq "auth_reader cannot INSERT system_user" \
+            "SELECT has_table_privilege('auth_reader', 'auth_schema.system_user', 'INSERT');" f
+          expect_eq "the role that owns system_user also set auth_schema's default privileges" \
+            "SELECT pg_get_userbyid(c.relowner) = pg_get_userbyid(d.defaclrole) FROM pg_class c, pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace WHERE c.oid = 'auth_schema.system_user'::regclass AND n.nspname = 'auth_schema' AND d.defaclobjtype = 'r';" t
+
+      - name: Constraint checks — system_user rejects bad rows for the right reason
+        # A rejected INSERT proves nothing by itself: each rejection must carry its
+        # SQLSTATE and the constraint or column it breaks, and each valid row must
+        # still be accepted. Placeholder hashes only: no value here is a secret.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          # $1 = description, $2 = SQL returning one value, $3 = expected value
+          expect_eq() {
+            local got
+            got=$($PSQL -tAc "$2" 2>&1 || true)
+            if [ "$got" != "$3" ]; then
+              echo "FAIL: $1: expected '$3', got '$got'"; exit 1
+            fi
+            echo "PASS: $1"
+          }
+
+          # $1 = SQLSTATE, $2 = constraint or column name, $3 = SQL that must violate it
+          expect_violation() {
+            local out
+            if out=$($PSQL -v VERBOSITY=verbose -c "$3" 2>&1); then
+              echo "FAIL: accepted, expected $2 ($1) to reject: $3"; exit 1
+            fi
+            if ! grep -q "ERROR:  $1: .*\"$2\"" <<< "$out"; then
+              echo "FAIL: rejected for the wrong reason, expected $2 ($1), got:"
+              echo "$out"; exit 1
+            fi
+            echo "PASS: rejected by $2 ($1)"
+          }
+
+          # $1 = SQL that must succeed, $2 = what it proves
+          expect_accepted() {
+            $PSQL -c "$1" || { echo "FAIL: rejected a valid control: $2"; exit 1; }
+            echo "PASS: accepted (control): $2"
+          }
+
+          expect_accepted "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES
+            ('Ada Admin', 'admin@synkro.test', 'placeholder-not-a-hash', 'ADMIN'),
+            ('Sam Sales', 'sales@synkro.test', 'placeholder-not-a-hash', 'SALESPERSON'),
+            ('Ivy Inventory', 'inventory@synkro.test', 'placeholder-not-a-hash', 'INVENTORY');" \
+            "one user for each of ADMIN, SALESPERSON and INVENTORY"
+          expect_eq "defaults are generated: user_id, registration_date and active = true" \
+            "SELECT count(DISTINCT user_id) FROM auth_schema.system_user WHERE active AND registration_date > now() - interval '1 hour';" 3
+
+          expect_violation 23514 chk_system_user_role \
+            "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES ('Service Role', 'service@synkro.test', 'placeholder-not-a-hash', 'SERVICE');"
+          expect_violation 23514 chk_system_user_role \
+            "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES ('Owner Role', 'owner@synkro.test', 'placeholder-not-a-hash', 'OWNER');"
+
+          expect_violation 23505 uq_system_user_email \
+            "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES ('Dup Admin', 'admin@synkro.test', 'placeholder-not-a-hash', 'ADMIN');"
+
+          expect_violation 23514 chk_system_user_name_length \
+            "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES ('', 'name-zero@synkro.test', 'placeholder-not-a-hash', 'ADMIN');"
+          expect_violation 23514 chk_system_user_name_length \
+            "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES (repeat('n', 151), 'name-151@synkro.test', 'placeholder-not-a-hash', 'ADMIN');"
+          expect_accepted "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES ('N', 'name-one@synkro.test', 'placeholder-not-a-hash', 'ADMIN');" \
+            "name of 1 character"
+          expect_accepted "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES (repeat('n', 150), 'name-150@synkro.test', 'placeholder-not-a-hash', 'ADMIN');" \
+            "name of 150 characters"
+
+          expect_violation 23514 chk_system_user_email_length \
+            "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES ('Email Two', 'ab', 'placeholder-not-a-hash', 'ADMIN');"
+          expect_violation 23514 chk_system_user_email_length \
+            "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES ('Email 256', repeat('e', 243) || '@example.test', 'placeholder-not-a-hash', 'ADMIN');"
+          expect_accepted "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES ('Email Three', 'a@b', 'placeholder-not-a-hash', 'ADMIN');" \
+            "email of 3 characters"
+          expect_accepted "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES ('Email 255', repeat('e', 242) || '@example.test', 'placeholder-not-a-hash', 'ADMIN');" \
+            "email of 255 characters"
+
+          # Every required column rejects NULL: SQLSTATE 23502, named by its column
+          declare -A VALUE=(
+            [user_id]="gen_random_uuid()"
+            [name]="'Null Name'"
+            [email]="'null-check@synkro.test'"
+            [password_hash]="'placeholder-not-a-hash'"
+            [role]="'ADMIN'"
+            [registration_date]="now()"
+            [active]="true"
+          )
+          columns="user_id, name, email, password_hash, role, registration_date, active"
+          for null_column in user_id name email password_hash role registration_date active; do
+            values=""
+            for column in user_id name email password_hash role registration_date active; do
+              value="${VALUE[$column]}"
+              if [ "$column" = "$null_column" ]; then value="NULL"; fi
+              values+="${values:+, }$value"
+            done
+            expect_violation 23502 "$null_column" \
+              "INSERT INTO auth_schema.system_user ($columns) VALUES ($values);"
+          done
+
+          # Clean up every row this step accepted
+          $PSQL -c "DELETE FROM auth_schema.system_user;"
+          expect_eq "system_user is empty after the checks" \
+            "SELECT count(*) FROM auth_schema.system_user;" 0
+
       - name: Apply rollbacks, highest version to lowest
         run: |
           set -euo pipefail
@@ -105,7 +286,7 @@ jobs:
                 psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -f "$f"
               done
 
-      - name: Confirm auth_schema and auth_writer no longer exist
+      - name: Confirm auth_schema, auth_writer and auth_reader no longer exist
         run: |
           result=$(psql -h localhost -U postgres -d postgres -tAc \
             "SELECT 1 FROM information_schema.schemata WHERE schema_name = 'auth_schema';")
@@ -117,6 +298,12 @@ jobs:
             "SELECT 1 FROM pg_roles WHERE rolname = 'auth_writer';")
           if [ -n "$result" ]; then
             echo "auth_writer still exists after applying all rollbacks"
+            exit 1
+          fi
+          result=$(psql -h localhost -U postgres -d postgres -tAc \
+            "SELECT 1 FROM pg_roles WHERE rolname = 'auth_reader';")
+          if [ -n "$result" ]; then
+            echo "auth_reader still exists after applying all rollbacks"
             exit 1
           fi
 
