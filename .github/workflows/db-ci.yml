@@ -320,6 +320,26 @@ jobs:
           expect_eq "system_user is empty after the checks" \
             "SELECT count(*) FROM auth_schema.system_user;" 0
 
+      - name: Index check — refresh_token is indexed by user, and every foreign key has an index
+        # A foreign key without an index makes each delete of its parent scan the child
+        # table. The query covers every foreign key of auth_schema, so the keys that
+        # HU-AUTH-06 adds are checked without changing this step.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          expect_eq "idx_refresh_token_user_id is on refresh_token (user_id)" \
+            "SELECT coalesce(pg_get_indexdef(to_regclass('auth_schema.idx_refresh_token_user_id')), '<none>');" \
+            "CREATE INDEX idx_refresh_token_user_id ON auth_schema.refresh_token USING btree (user_id)"
+          # Without this guard the next check passes when there are no foreign keys at all
+          expect_eq "auth_schema has foreign keys to check" \
+            "SELECT count(*) > 0 FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'f' AND n.nspname = 'auth_schema';" t
+          expect_eq "every foreign key of auth_schema has an index starting with its column" \
+            "SELECT coalesce(string_agg(c.conname, ', ' ORDER BY c.conname), '') FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'f' AND n.nspname = 'auth_schema' AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.conrelid AND i.indkey[0] = c.conkey[1]);" \
+            ""
+
       - name: Apply rollbacks, highest version to lowest
         run: |
           set -euo pipefail
