@@ -565,6 +565,168 @@ jobs:
             "SELECT coalesce(pg_get_indexdef(to_regclass('auth_schema.idx_service_token_issued_by')), '<none>');" \
             "CREATE INDEX idx_service_token_issued_by ON auth_schema.service_token USING btree (issued_by)"
 
+      - name: AUTH-AUDIT-01 — user_creation_audit has the specified shape
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          expect_eq "user_creation_audit has exactly the specified columns and types" \
+            "SELECT string_agg(a.attname || ' ' || format_type(a.atttypid, a.atttypmod) || CASE WHEN a.attnotnull THEN ' NOT NULL' ELSE '' END, ', ' ORDER BY a.attnum) FROM pg_attribute a WHERE a.attrelid = 'auth_schema.user_creation_audit'::regclass AND a.attnum > 0 AND NOT a.attisdropped;" \
+            "audit_id uuid NOT NULL, operation text NOT NULL, actor_kind text NOT NULL, actor_user_id uuid, operator_identity text, created_user_id uuid NOT NULL, outcome text NOT NULL, occurred_at timestamp with time zone NOT NULL, correlation_id text NOT NULL"
+          expect_eq "no column has a default: Auth supplies every value itself" \
+            "SELECT count(*) FROM pg_attrdef WHERE adrelid = 'auth_schema.user_creation_audit'::regclass;" 0
+          expect_eq "user_creation_audit has exactly the specified named constraints" \
+            "SELECT string_agg(conname, ', ' ORDER BY conname) FROM pg_constraint WHERE conrelid = 'auth_schema.user_creation_audit'::regclass;" \
+            "chk_user_creation_audit_actor, chk_user_creation_audit_actor_kind, chk_user_creation_audit_correlation_id, chk_user_creation_audit_operation, chk_user_creation_audit_operator_identity, chk_user_creation_audit_outcome, fk_user_creation_audit_actor, fk_user_creation_audit_created_user, pk_user_creation_audit, uq_user_creation_audit_created_user"
+          expect_eq "both foreign keys point to system_user with ON DELETE RESTRICT" \
+            "SELECT string_agg(conname || ' -> ' || confrelid::regclass || ' ' || confdeltype::text, ', ' ORDER BY conname) FROM pg_constraint WHERE conrelid = 'auth_schema.user_creation_audit'::regclass AND contype = 'f';" \
+            "fk_user_creation_audit_actor -> auth_schema.\"system_user\" r, fk_user_creation_audit_created_user -> auth_schema.\"system_user\" r"
+          expect_eq "idx_user_creation_audit_actor_user_id is on user_creation_audit (actor_user_id)" \
+            "SELECT coalesce(pg_get_indexdef(to_regclass('auth_schema.idx_user_creation_audit_actor_user_id')), '<none>');" \
+            "CREATE INDEX idx_user_creation_audit_actor_user_id ON auth_schema.user_creation_audit USING btree (actor_user_id)"
+          expect_eq "the table has no more indexes than its key, its unique constraint and the actor index" \
+            "SELECT count(*) FROM pg_indexes WHERE schemaname = 'auth_schema' AND tablename = 'user_creation_audit';" 3
+
+      - name: AUTH-AUDIT-01 — user_creation_audit accepts valid records and rejects invalid ones
+        # Every rejection carries its SQLSTATE and the constraint or column it breaks, next
+        # to a valid control. A failed check reports the first violated CHECK in name order,
+        # so each invalid row breaks exactly one rule. Placeholder data only.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          audit_columns="audit_id, operation, actor_kind, actor_user_id, operator_identity, created_user_id, outcome, occurred_at, correlation_id"
+          # $1 = the e-mail local part of a user created below
+          user_id_of() { echo "(SELECT user_id FROM auth_schema.system_user WHERE email = '$1@synkro.test')"; }
+          # $1 operation, $2 actor_kind, $3 actor_user_id, $4 operator_identity,
+          # $5 created_user_id, $6 outcome, $7 occurred_at, $8 correlation_id (SQL literals)
+          audit_insert() {
+            echo "INSERT INTO auth_schema.user_creation_audit ($audit_columns) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8);"
+          }
+
+          expect_accepted "INSERT INTO auth_schema.system_user (name, email, password_hash, role) VALUES
+            ('Audit Admin', 'audit-admin@synkro.test', 'placeholder-not-a-hash', 'ADMIN'),
+            ('Audit Sales', 'audit-sales@synkro.test', 'placeholder-not-a-hash', 'SALESPERSON'),
+            ('Audit Stock', 'audit-stock@synkro.test', 'placeholder-not-a-hash', 'INVENTORY'),
+            ('Audit Spare', 'audit-spare@synkro.test', 'placeholder-not-a-hash', 'INVENTORY'),
+            ('Audit Null', 'audit-null@synkro.test', 'placeholder-not-a-hash', 'INVENTORY'),
+            ('Audit Deputy', 'audit-deputy@synkro.test', 'placeholder-not-a-hash', 'ADMIN'),
+            ('Audit Hire', 'audit-hire@synkro.test', 'placeholder-not-a-hash', 'SALESPERSON');" \
+            "the users the audit records will point to"
+
+          # --- 1. valid ADMIN and OPERATOR success records, with every attribution field kept
+          expect_accepted "$(audit_insert "'INITIAL_ADMIN_CREATED'" "'OPERATOR'" NULL "'deploy-operator@ci'" "$(user_id_of audit-admin)" "'SUCCESS'" "'2026-10-10 12:00:00+00'" "'cli-0001'")" \
+            "an OPERATOR record that creates the initial administrator"
+          expect_accepted "$(audit_insert "'USER_REGISTERED'" "'ADMIN'" "$(user_id_of audit-admin)" NULL "$(user_id_of audit-sales)" "'SUCCESS'" "'2026-10-10 12:05:00+00'" "'http-0001'")" \
+            "an ADMIN record that registers a SALESPERSON"
+          expect_accepted "$(audit_insert "'USER_REGISTERED'" "'ADMIN'" "$(user_id_of audit-admin)" NULL "$(user_id_of audit-stock)" "'SUCCESS'" "now()" "'x'")" \
+            "an ADMIN record that registers an INVENTORY user, with a 1-character correlation id"
+          expect_accepted "$(audit_insert "'USER_REGISTERED'" "'ADMIN'" "$(user_id_of audit-deputy)" NULL "$(user_id_of audit-hire)" "'SUCCESS'" "now()" "'http-0002'")" \
+            "an ADMIN record whose acting ADMIN is not the created user of any record"
+          expect_eq "the OPERATOR record keeps its operation, identity, creator, outcome, time and correlation id" \
+            "SELECT operation || '|' || actor_kind || '|' || coalesce(actor_user_id::text, 'null') || '|' || operator_identity || '|' || (created_user_id = $(user_id_of audit-admin)) || '|' || outcome || '|' || (occurred_at AT TIME ZONE 'UTC') || '|' || correlation_id FROM auth_schema.user_creation_audit WHERE correlation_id = 'cli-0001';" \
+            "INITIAL_ADMIN_CREATED|OPERATOR|null|deploy-operator@ci|true|SUCCESS|2026-10-10 12:00:00|cli-0001"
+          expect_eq "the ADMIN record keeps its operation, actor, created user, outcome, time and correlation id" \
+            "SELECT operation || '|' || actor_kind || '|' || (actor_user_id = $(user_id_of audit-admin)) || '|' || coalesce(operator_identity, 'null') || '|' || (created_user_id = $(user_id_of audit-sales)) || '|' || outcome || '|' || (occurred_at AT TIME ZONE 'UTC') || '|' || correlation_id FROM auth_schema.user_creation_audit WHERE correlation_id = 'http-0001';" \
+            "USER_REGISTERED|ADMIN|true|null|true|SUCCESS|2026-10-10 12:05:00|http-0001"
+
+          # --- 2. invalid actor / operation combinations
+          # operation outside the closed set (a combination rule cannot fire for an unknown operation)
+          expect_violation 23514 chk_user_creation_audit_operation \
+            "$(audit_insert "'USER_DELETED'" "'ADMIN'" "$(user_id_of audit-admin)" NULL "$(user_id_of audit-spare)" "'SUCCESS'" "now()" "'c'")"
+          # an ordinary registration must come from an ADMIN user, never an OPERATOR
+          expect_violation 23514 chk_user_creation_audit_actor \
+            "$(audit_insert "'USER_REGISTERED'" "'OPERATOR'" NULL "'deploy-operator@ci'" "$(user_id_of audit-spare)" "'SUCCESS'" "now()" "'c'")"
+          # a registration without the ADMIN that performed it
+          expect_violation 23514 chk_user_creation_audit_actor \
+            "$(audit_insert "'USER_REGISTERED'" "'ADMIN'" NULL NULL "$(user_id_of audit-spare)" "'SUCCESS'" "now()" "'c'")"
+          # a registration that also claims an operator identity
+          expect_violation 23514 chk_user_creation_audit_actor \
+            "$(audit_insert "'USER_REGISTERED'" "'ADMIN'" "$(user_id_of audit-admin)" "'deploy-operator@ci'" "$(user_id_of audit-spare)" "'SUCCESS'" "now()" "'c'")"
+          # an initialization must not be attributed to an application ADMIN
+          expect_violation 23514 chk_user_creation_audit_actor \
+            "$(audit_insert "'INITIAL_ADMIN_CREATED'" "'ADMIN'" "$(user_id_of audit-admin)" NULL "$(user_id_of audit-spare)" "'SUCCESS'" "now()" "'c'")"
+          # an initialization without the operator identity
+          expect_violation 23514 chk_user_creation_audit_actor \
+            "$(audit_insert "'INITIAL_ADMIN_CREATED'" "'OPERATOR'" NULL NULL "$(user_id_of audit-spare)" "'SUCCESS'" "now()" "'c'")"
+          # an initialization that also names an application actor
+          expect_violation 23514 chk_user_creation_audit_actor \
+            "$(audit_insert "'INITIAL_ADMIN_CREATED'" "'OPERATOR'" "$(user_id_of audit-admin)" "'deploy-operator@ci'" "$(user_id_of audit-spare)" "'SUCCESS'" "now()" "'c'")"
+          # an actor kind outside ADMIN / OPERATOR is also an invalid combination
+          expect_violation 23514 chk_user_creation_audit_actor \
+            "$(audit_insert "'USER_REGISTERED'" "'SERVICE'" "$(user_id_of audit-admin)" NULL "$(user_id_of audit-spare)" "'SUCCESS'" "now()" "'c'")"
+          # only successes are recorded: failed attempts belong to the security logs
+          expect_violation 23514 chk_user_creation_audit_outcome \
+            "$(audit_insert "'USER_REGISTERED'" "'ADMIN'" "$(user_id_of audit-admin)" NULL "$(user_id_of audit-spare)" "'FAILURE'" "now()" "'c'")"
+          expect_violation 23514 chk_user_creation_audit_outcome \
+            "$(audit_insert "'USER_REGISTERED'" "'ADMIN'" "$(user_id_of audit-admin)" NULL "$(user_id_of audit-spare)" "'success'" "now()" "'c'")"
+
+          # --- 3. required identity fields: every NOT NULL column rejects NULL (SQLSTATE 23502)
+          declare -A VALUE=(
+            [audit_id]="gen_random_uuid()"
+            [operation]="'USER_REGISTERED'"
+            [actor_kind]="'ADMIN'"
+            [actor_user_id]="$(user_id_of audit-admin)"
+            [operator_identity]="NULL"
+            [created_user_id]="$(user_id_of audit-null)"
+            [outcome]="'SUCCESS'"
+            [occurred_at]="now()"
+            [correlation_id]="'c'"
+          )
+          for null_column in audit_id operation actor_kind created_user_id outcome occurred_at correlation_id; do
+            values=""
+            for column in ${audit_columns//,/}; do
+              value="${VALUE[$column]}"
+              if [ "$column" = "$null_column" ]; then value="NULL"; fi
+              values+="${values:+, }$value"
+            done
+            expect_violation 23502 "$null_column" \
+              "INSERT INTO auth_schema.user_creation_audit ($audit_columns) VALUES ($values);"
+          done
+          # the empty correlation id is as good as missing
+          expect_violation 23514 chk_user_creation_audit_correlation_id \
+            "$(audit_insert "'USER_REGISTERED'" "'ADMIN'" "$(user_id_of audit-admin)" NULL "$(user_id_of audit-null)" "'SUCCESS'" "now()" "''")"
+
+          # --- 4. one record per created user, one record per audit id
+          expect_violation 23505 uq_user_creation_audit_created_user \
+            "$(audit_insert "'USER_REGISTERED'" "'ADMIN'" "$(user_id_of audit-admin)" NULL "$(user_id_of audit-sales)" "'SUCCESS'" "now()" "'http-dup'")"
+          expect_violation 23505 uq_user_creation_audit_created_user \
+            "$(audit_insert "'INITIAL_ADMIN_CREATED'" "'OPERATOR'" NULL "'deploy-operator@ci'" "$(user_id_of audit-admin)" "'SUCCESS'" "now()" "'cli-dup'")"
+          expect_violation 23505 pk_user_creation_audit \
+            "INSERT INTO auth_schema.user_creation_audit ($audit_columns) SELECT audit_id, operation, actor_kind, actor_user_id, operator_identity, $(user_id_of audit-spare), outcome, occurred_at, 'pk-dup' FROM auth_schema.user_creation_audit WHERE correlation_id = 'http-0001';"
+
+          # --- 5. foreign keys and text limits
+          expect_violation 23503 fk_user_creation_audit_actor \
+            "$(audit_insert "'USER_REGISTERED'" "'ADMIN'" "'99999999-9999-9999-9999-999999999999'" NULL "$(user_id_of audit-spare)" "'SUCCESS'" "now()" "'c'")"
+          expect_violation 23503 fk_user_creation_audit_created_user \
+            "$(audit_insert "'USER_REGISTERED'" "'ADMIN'" "$(user_id_of audit-admin)" NULL "'99999999-9999-9999-9999-999999999999'" "'SUCCESS'" "now()" "'c'")"
+          # RESTRICT: neither the created user nor the acting ADMIN can be deleted while a record names them
+          expect_violation 23503 fk_user_creation_audit_created_user \
+            "DELETE FROM auth_schema.system_user WHERE email = 'audit-hire@synkro.test';"
+          expect_violation 23503 fk_user_creation_audit_actor \
+            "DELETE FROM auth_schema.system_user WHERE email = 'audit-deputy@synkro.test';"
+          expect_accepted "DELETE FROM auth_schema.system_user WHERE email = 'audit-spare@synkro.test';" \
+            "deleting a user that no audit record names"
+
+          expect_violation 23514 chk_user_creation_audit_operator_identity \
+            "$(audit_insert "'INITIAL_ADMIN_CREATED'" "'OPERATOR'" NULL "repeat('o', 201)" "$(user_id_of audit-null)" "'SUCCESS'" "now()" "'c'")"
+          expect_violation 23514 chk_user_creation_audit_operator_identity \
+            "$(audit_insert "'INITIAL_ADMIN_CREATED'" "'OPERATOR'" NULL "''" "$(user_id_of audit-null)" "'SUCCESS'" "now()" "'c'")"
+          expect_accepted "$(audit_insert "'INITIAL_ADMIN_CREATED'" "'OPERATOR'" NULL "repeat('o', 200)" "$(user_id_of audit-null)" "'SUCCESS'" "now()" "'cli-200'")" \
+            "an operator identity of 200 characters"
+
+          # Clean up every row this step accepted: records first, then the users they name
+          $PSQL -c "DELETE FROM auth_schema.user_creation_audit;"
+          $PSQL -c "DELETE FROM auth_schema.system_user;"
+          expect_eq "user_creation_audit is empty after the checks" \
+            "SELECT count(*) FROM auth_schema.user_creation_audit;" 0
+          expect_eq "system_user is empty after the checks" \
+            "SELECT count(*) FROM auth_schema.system_user;" 0
+
       - name: Privilege check — auth_app cannot DELETE from any table of auth_schema
         # Schema-wide: the query reads the ordinary tables of auth_schema from the catalog,
         # so a table added later is checked without editing this step. has_table_privilege
