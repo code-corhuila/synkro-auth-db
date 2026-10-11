@@ -856,7 +856,7 @@ jobs:
             "SELECT count(*) FROM $audit_table;" 0
 
       - name: AUTH-AUDIT-01 — a role of another domain cannot see or touch user_creation_audit
-        # The other domains share this instance (ADR-009) with a login role each. The
+        # The other domains share this instance and each has its own login role. The
         # stand-in below is created for the check and dropped at the end.
         run: |
           set -euo pipefail
