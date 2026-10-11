@@ -727,6 +727,172 @@ jobs:
           expect_eq "system_user is empty after the checks" \
             "SELECT count(*) FROM auth_schema.system_user;" 0
 
+      - name: AUTH-AUDIT-01 — user_creation_audit grants are append-only for every role
+        # Effective privileges, read with has_table_privilege so a grant inherited through
+        # auth_writer or PUBLIC counts. The exact ACL is also compared, so a grant that
+        # no role of this list explains cannot hide behind the effective check.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          audit_table="auth_schema.user_creation_audit"
+          # $1 = role, $2 = the privileges it must have; it must lack every other one
+          expect_privileges() {
+            local privilege wanted
+            for privilege in SELECT INSERT UPDATE DELETE TRUNCATE REFERENCES TRIGGER; do
+              wanted=f
+              if [[ " $2 " == *" $privilege "* ]]; then wanted=t; fi
+              expect_eq "$1 $([ "$wanted" = t ] && echo has || echo lacks) $privilege on user_creation_audit" \
+                "SELECT has_table_privilege('$1', '$audit_table', '$privilege');" "$wanted"
+            done
+          }
+
+          expect_privileges auth_writer "SELECT INSERT"
+          expect_privileges auth_reader "SELECT"
+          expect_privileges auth_app "SELECT INSERT"
+
+          expect_eq "no role other than the owner holds a privilege here, apart from auth_writer and auth_reader" \
+            "SELECT coalesce(string_agg(DISTINCT coalesce(r.rolname, 'PUBLIC') || ':' || a.privilege_type, ', ' ORDER BY coalesce(r.rolname, 'PUBLIC') || ':' || a.privilege_type), '') FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a LEFT JOIN pg_roles r ON r.oid = a.grantee WHERE c.oid = '$audit_table'::regclass AND a.grantee <> c.relowner;" \
+            "auth_reader:SELECT, auth_writer:INSERT, auth_writer:SELECT"
+          expect_eq "PUBLIC holds no privilege on user_creation_audit" \
+            "SELECT count(*) FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE c.oid = '$audit_table'::regclass AND a.grantee = 0;" 0
+          expect_eq "auth_app has no direct grant on user_creation_audit" \
+            "SELECT count(*) FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE c.oid = '$audit_table'::regclass AND r.rolname = 'auth_app';" 0
+          expect_eq "no column carries a privilege of its own" \
+            "SELECT count(*) FROM pg_attribute WHERE attrelid = '$audit_table'::regclass AND attacl IS NOT NULL;" 0
+          expect_eq "auth_app can update no column of user_creation_audit" \
+            "SELECT has_any_column_privilege('auth_app', '$audit_table', 'UPDATE');" f
+
+          expect_eq "the migration owner owns user_creation_audit, as it owns system_user" \
+            "SELECT (SELECT relowner FROM pg_class WHERE oid = '$audit_table'::regclass) = (SELECT relowner FROM pg_class WHERE oid = 'auth_schema.system_user'::regclass);" t
+          expect_eq "auth_app does not own user_creation_audit and is not a member of its owner" \
+            "SELECT NOT pg_has_role('auth_app', c.relowner, 'USAGE') AND pg_get_userbyid(c.relowner) <> 'auth_app' FROM pg_class c WHERE c.oid = '$audit_table'::regclass;" t
+          expect_eq "auth_app is neither superuser nor allowed to bypass row security" \
+            "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = 'auth_app';" f
+
+      - name: AUTH-AUDIT-01 — auth_app appends audit records through its own login and cannot change them
+        # A second connection authenticated as auth_app itself, not SET ROLE from the
+        # administrator: what is proved here is what the service really holds.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+          PSQL_APP="env PGPASSWORD=ci_app_pw psql -h localhost -U auth_app -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          audit_table="auth_schema.user_creation_audit"
+
+          PSQL="$PSQL_APP" expect_eq "the connection is auth_app itself, not a SET ROLE" \
+            "SELECT session_user || '/' || current_user;" "auth_app/auth_app"
+
+          PSQL="$PSQL_APP" expect_eq "auth_app can SELECT user_creation_audit" \
+            "SELECT count(*) FROM $audit_table;" 0
+          # Registration commits the user and its audit record in one transaction: one statement here
+          PSQL="$PSQL_APP" expect_accepted "WITH admin AS (
+              INSERT INTO auth_schema.system_user (name, email, password_hash, role)
+              VALUES ('App Admin', 'app-admin@synkro.test', 'placeholder-not-a-hash', 'ADMIN') RETURNING user_id
+            ), hire AS (
+              INSERT INTO auth_schema.system_user (name, email, password_hash, role)
+              VALUES ('App Hire', 'app-hire@synkro.test', 'placeholder-not-a-hash', 'SALESPERSON') RETURNING user_id
+            )
+            INSERT INTO $audit_table (audit_id, operation, actor_kind, actor_user_id, operator_identity, created_user_id, outcome, occurred_at, correlation_id)
+            SELECT gen_random_uuid(), 'USER_REGISTERED', 'ADMIN', admin.user_id, NULL, hire.user_id, 'SUCCESS', now(), 'app-0001'
+            FROM admin, hire;" \
+            "auth_app registers a user and appends its audit record"
+          PSQL="$PSQL_APP" expect_eq "auth_app reads back the record it appended" \
+            "SELECT count(*) FROM $audit_table WHERE correlation_id = 'app-0001';" 1
+
+          # The audit rows are append-only for the service itself
+          PSQL="$PSQL_APP" expect_denied "UPDATE" \
+            "UPDATE $audit_table SET correlation_id = 'tampered';"
+          PSQL="$PSQL_APP" expect_denied "UPDATE of the created user" \
+            "UPDATE $audit_table SET created_user_id = actor_user_id;"
+          PSQL="$PSQL_APP" expect_denied "DELETE" \
+            "DELETE FROM $audit_table;"
+          PSQL="$PSQL_APP" expect_denied "TRUNCATE" \
+            "TRUNCATE $audit_table;"
+          PSQL="$PSQL_APP" expect_denied "upsert that would rewrite a record" \
+            "INSERT INTO $audit_table (audit_id, operation, actor_kind, actor_user_id, created_user_id, outcome, occurred_at, correlation_id) SELECT audit_id, operation, actor_kind, actor_user_id, created_user_id, outcome, occurred_at, 'rewritten' FROM $audit_table ON CONFLICT (audit_id) DO UPDATE SET correlation_id = EXCLUDED.correlation_id;"
+          PSQL="$PSQL_APP" expect_denied "row lock that precedes an update" \
+            "SELECT * FROM $audit_table FOR UPDATE;"
+
+          # The structure and the constraints cannot be altered or bypassed by the service
+          PSQL="$PSQL_APP" expect_denied "ALTER TABLE ADD COLUMN" \
+            "ALTER TABLE $audit_table ADD COLUMN note text;"
+          PSQL="$PSQL_APP" expect_denied "ALTER TABLE DROP CONSTRAINT" \
+            "ALTER TABLE $audit_table DROP CONSTRAINT chk_user_creation_audit_actor;"
+          PSQL="$PSQL_APP" expect_denied "ALTER TABLE DROP NOT NULL" \
+            "ALTER TABLE $audit_table ALTER COLUMN correlation_id DROP NOT NULL;"
+          PSQL="$PSQL_APP" expect_denied "ALTER TABLE DISABLE TRIGGER ALL (skips foreign key checks)" \
+            "ALTER TABLE $audit_table DISABLE TRIGGER ALL;"
+          PSQL="$PSQL_APP" expect_denied "ALTER TABLE OWNER TO itself" \
+            "ALTER TABLE $audit_table OWNER TO auth_app;"
+          PSQL="$PSQL_APP" expect_denied "CREATE TRIGGER" \
+            "CREATE TRIGGER probe_trigger BEFORE INSERT ON $audit_table FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();"
+          PSQL="$PSQL_APP" expect_denied "DROP TABLE" \
+            "DROP TABLE $audit_table;"
+          PSQL="$PSQL_APP" expect_denied "SET session_replication_role (skips foreign key checks)" \
+            "SET session_replication_role = replica;"
+          # An INSERT still obeys every constraint when it comes from the service
+          PSQL="$PSQL_APP" expect_violation 23514 chk_user_creation_audit_actor \
+            "INSERT INTO $audit_table (audit_id, operation, actor_kind, operator_identity, created_user_id, outcome, occurred_at, correlation_id) SELECT gen_random_uuid(), 'USER_REGISTERED', 'OPERATOR', 'app-operator', user_id, 'SUCCESS', now(), 'app-0002' FROM auth_schema.system_user WHERE email = 'app-admin@synkro.test';"
+          # Granting itself the missing privilege does nothing: auth_app is not the owner
+          PSQL="$PSQL_APP" expect_accepted "GRANT UPDATE, DELETE, TRUNCATE ON $audit_table TO auth_app;" \
+            "the GRANT only warns that nothing was granted"
+          expect_eq "auth_app still cannot UPDATE, DELETE or TRUNCATE after trying to grant itself" \
+            "SELECT has_table_privilege('auth_app', '$audit_table', 'UPDATE') OR has_table_privilege('auth_app', '$audit_table', 'DELETE') OR has_table_privilege('auth_app', '$audit_table', 'TRUNCATE');" f
+
+          expect_eq "the record is unchanged after every refused statement" \
+            "SELECT count(*) || '|' || min(correlation_id) FROM $audit_table;" "1|app-0001"
+          expect_eq "the table keeps its shape: nine columns" \
+            "SELECT count(*) FROM pg_attribute WHERE attrelid = '$audit_table'::regclass AND attnum > 0 AND NOT attisdropped;" 9
+
+          # Clean up every row this step accepted: records first, then the users they name
+          $PSQL -c "DELETE FROM $audit_table;"
+          $PSQL -c "DELETE FROM auth_schema.system_user;"
+          expect_eq "user_creation_audit is empty after the checks" \
+            "SELECT count(*) FROM $audit_table;" 0
+
+      - name: AUTH-AUDIT-01 — a role of another domain cannot see or touch user_creation_audit
+        # The other domains share this instance (ADR-009) with a login role each. The
+        # stand-in below is created for the check and dropped at the end.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+          PSQL_OTHER="env PGPASSWORD=ci_other_pw psql -h localhost -U probe_other_domain_app -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/db-checks.sh
+
+          audit_table="auth_schema.user_creation_audit"
+
+          $PSQL -c "CREATE ROLE probe_other_domain_app LOGIN PASSWORD 'ci_other_pw';"
+
+          PSQL="$PSQL_OTHER" expect_eq "the other-domain role connects as itself" \
+            "SELECT session_user;" probe_other_domain_app
+          expect_eq "the other-domain role belongs to no auth role" \
+            "SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member WHERE r.rolname = 'probe_other_domain_app';" 0
+          expect_eq "the other-domain role has no USAGE on auth_schema" \
+            "SELECT has_schema_privilege('probe_other_domain_app', 'auth_schema', 'USAGE');" f
+          for privilege in SELECT INSERT UPDATE DELETE TRUNCATE REFERENCES TRIGGER; do
+            expect_eq "the other-domain role lacks $privilege on user_creation_audit" \
+              "SELECT has_table_privilege('probe_other_domain_app', '$audit_table', '$privilege');" f
+          done
+
+          PSQL="$PSQL_OTHER" expect_denied "SELECT" "SELECT count(*) FROM $audit_table;"
+          PSQL="$PSQL_OTHER" expect_denied "INSERT" \
+            "INSERT INTO $audit_table (audit_id, operation, actor_kind, created_user_id, outcome, occurred_at, correlation_id) VALUES (gen_random_uuid(), 'USER_REGISTERED', 'ADMIN', gen_random_uuid(), 'SUCCESS', now(), 'other-0001');"
+          PSQL="$PSQL_OTHER" expect_denied "UPDATE" "UPDATE $audit_table SET correlation_id = 'other';"
+          PSQL="$PSQL_OTHER" expect_denied "DELETE" "DELETE FROM $audit_table;"
+          PSQL="$PSQL_OTHER" expect_denied "TRUNCATE" "TRUNCATE $audit_table;"
+          PSQL="$PSQL_OTHER" expect_eq "the table is not even listed for the other-domain role" \
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'auth_schema';" 0
+
+          $PSQL -c "DROP ROLE probe_other_domain_app;"
+          expect_eq "the other-domain stand-in role is dropped" \
+            "SELECT count(*) FROM pg_roles WHERE rolname = 'probe_other_domain_app';" 0
+
       - name: Privilege check — auth_app cannot DELETE from any table of auth_schema
         # Schema-wide: the query reads the ordinary tables of auth_schema from the catalog,
         # so a table added later is checked without editing this step. has_table_privilege
