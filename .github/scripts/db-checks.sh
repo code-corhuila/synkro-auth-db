@@ -29,3 +29,17 @@ expect_accepted() {
   $PSQL -c "$1" || { echo "FAIL: rejected a valid control: $2"; exit 1; }
   echo "PASS: accepted (control): $2"
 }
+
+# $1 = description, $2 = SQL that must be refused for lack of privilege (SQLSTATE 42501).
+# Run it as another role by setting PSQL for the call: PSQL="$PSQL_APP" expect_denied ...
+expect_denied() {
+  local out
+  if out=$($PSQL -v VERBOSITY=verbose -c "$2" 2>&1); then
+    echo "FAIL: allowed, expected permission denied ($1): $2"; exit 1
+  fi
+  if ! grep -q "ERROR:  42501: " <<< "$out"; then
+    echo "FAIL: refused for the wrong reason, expected 42501 ($1), got:"
+    echo "$out"; exit 1
+  fi
+  echo "PASS: denied ($1)"
+}
