@@ -220,3 +220,16 @@ act push -W .github/workflows/db-ci.yml -P ubuntu-latest=catthehacker/ubuntu:act
 
 The workflow's PostgreSQL service listens on host port 5432, so stop any PostgreSQL that already
 uses that port before running it.
+
+## Root composition integration (HU-INF-02)
+
+Flyway uses `auth_schema` as its only/default schema and stores its ledger in
+`auth_schema.flyway_schema_history`. No historical migration was changed.
+The tooling runner mounts this repository read-only. Root infrastructure waits
+for authenticated PostgreSQL readiness before deliberately invoking it.
+
+If `public.flyway_schema_history` exists in an established environment, stop.
+Take a backup, inventory its domain/version/checksum records and obtain a reviewed
+reconciliation procedure. Do not repair, move or delete that ledger automatically.
+CI drops its disposable schema history **before** the schema-dropping rollback.
+Run `python3 tests/test_history_contract.py` for the configuration regression.
