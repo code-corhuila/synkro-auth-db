@@ -2,13 +2,17 @@ name: db-ci
 
 on:
   push:
-    branches: [develop, qa, main]
+    branches: [develop, qa, main, fix/root-composition-integration]
   pull_request:
     branches: [develop, qa, main]
+
+permissions:
+  contents: read
 
 jobs:
   migration-rebuild:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16-alpine
@@ -27,6 +31,8 @@ jobs:
       PGPASSWORD: ci_admin_pw
     steps:
       - uses: actions/checkout@v4
+      - name: Verify schema-isolated history contract
+        run: python3 tests/test_history_contract.py
 
       - name: Install psql
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
@@ -71,7 +77,7 @@ jobs:
           flyway -configFiles=flyway.toml migrate
           expected=$(find 01_ddl 02_dml 03_dcl 04_tcl -name 'V*.sql' | wc -l)
           applied=$(psql -h localhost -U postgres -d postgres -tAc \
-            "SELECT count(*) FROM flyway_schema_history WHERE success AND version IS NOT NULL;")
+            "SELECT count(*) FROM auth_schema.flyway_schema_history WHERE success AND version IS NOT NULL;")
           echo "V migrations in repository: $expected, applied: $applied"
           if [ "$expected" -eq 0 ] || [ "$applied" != "$expected" ]; then
             echo "Applied migrations do not match the repository"
@@ -905,7 +911,7 @@ jobs:
 
           # Without this guard the next check passes when the schema has no table at all
           expect_eq "auth_schema has tables to check" \
-            "SELECT count(*) > 0 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'auth_schema' AND c.relkind = 'r';" t
+            "SELECT count(*) > 0 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'auth_schema' AND c.relkind = 'r' AND c.relname <> 'flyway_schema_history';" t
           expect_eq "auth_app cannot DELETE from any table of auth_schema" \
             "SELECT coalesce(string_agg(c.relname, ', ' ORDER BY c.relname), '') FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'auth_schema' AND c.relkind = 'r' AND has_table_privilege('auth_app', c.oid, 'DELETE');" \
             ""
@@ -913,6 +919,7 @@ jobs:
       - name: Apply rollbacks, highest version to lowest
         run: |
           set -euo pipefail
+          psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -c "DROP TABLE IF EXISTS auth_schema.flyway_schema_history;"
           find 05_rollbacks -name 'U*.sql' -printf '%f\t%p\n' \
             | sort -r \
             | cut -f2 \
@@ -942,10 +949,8 @@ jobs:
             exit 1
           fi
 
-      - name: Drop flyway_schema_history and migrate again
+      - name: Migrate again after disposable reconstruction
         run: |
-          psql -h localhost -U postgres -d postgres -c \
-            "DROP TABLE IF EXISTS flyway_schema_history;"
           flyway -configFiles=flyway.toml migrate
 
       - name: AUTH-AUDIT-01 — every V migration has its U rollback
@@ -978,7 +983,7 @@ jobs:
           last_earlier_version=13
 
           checksums() {
-            $PSQL -tAc "SELECT string_agg(version || ':' || checksum, ',' ORDER BY installed_rank) FROM flyway_schema_history WHERE version::int <= $last_earlier_version;"
+            $PSQL -tAc "SELECT string_agg(version || ':' || checksum, ',' ORDER BY installed_rank) FROM auth_schema.flyway_schema_history WHERE version::int <= $last_earlier_version;"
           }
           fingerprint() {
             local table
@@ -998,7 +1003,7 @@ jobs:
           checksums_before=$(checksums)
           fingerprint_before=$(fingerprint)
           expect_eq "the checksums of V001 to V013 were recorded" \
-            "SELECT count(*) FROM flyway_schema_history WHERE version::int <= $last_earlier_version AND checksum IS NOT NULL;" 13
+            "SELECT count(*) FROM auth_schema.flyway_schema_history WHERE version::int <= $last_earlier_version AND checksum IS NOT NULL;" 13
 
           # Roll the audit migrations back, highest first, and let Flyway forget them
           expect_eq "there are exactly four audit rollbacks, U014 to U017" \
@@ -1007,14 +1012,14 @@ jobs:
             echo "Applying $f"
             $PSQL -f "$f"
           done
-          $PSQL -c "DELETE FROM flyway_schema_history WHERE version::int >= $audit_versions;"
+          $PSQL -c "DELETE FROM auth_schema.flyway_schema_history WHERE version::int >= $audit_versions;"
 
           expect_eq "user_creation_audit is gone after its rollbacks" \
             "SELECT to_regclass('auth_schema.user_creation_audit') IS NULL;" t
           expect_eq "idx_user_creation_audit_actor_user_id is gone after its rollbacks" \
             "SELECT to_regclass('auth_schema.idx_user_creation_audit_actor_user_id') IS NULL;" t
           expect_eq "the four earlier tables are still there" \
-            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'auth_schema' AND c.relkind = 'r';" 4
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'auth_schema' AND c.relkind = 'r' AND c.relname <> 'flyway_schema_history';" 4
           [ "$(fingerprint)" = "$fingerprint_before" ] || { echo "FAIL: the earlier data changed during the rollbacks"; exit 1; }
           echo "PASS: the earlier data is untouched by the rollbacks"
 
@@ -1038,7 +1043,7 @@ jobs:
           expect_eq "system_user gained no authorship column" \
             "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'auth_schema' AND table_name = 'system_user' AND column_name ~ '(created|creator|author)';" 0
           expect_eq "auth_schema holds the four earlier tables and the audit table, no initialization-control table" \
-            "SELECT string_agg(c.relname, ', ' ORDER BY c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'auth_schema' AND c.relkind = 'r';" \
+            "SELECT string_agg(c.relname, ', ' ORDER BY c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'auth_schema' AND c.relkind = 'r' AND c.relname <> 'flyway_schema_history';" \
             "idempotency_key, refresh_token, service_token, system_user, user_creation_audit"
           expect_eq "the earlier tables keep their privileges: auth_app can still UPDATE system_user" \
             "SELECT has_table_privilege('auth_app', 'auth_schema.system_user', 'UPDATE');" t
