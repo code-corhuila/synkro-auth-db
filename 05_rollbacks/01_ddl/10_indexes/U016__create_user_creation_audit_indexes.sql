@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS auth_schema.idx_user_creation_audit_actor_user_id;
