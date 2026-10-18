@@ -26,8 +26,11 @@ Full policy: `00-governance/branching-policy.md` in `synkro-docs`.
 
 ## Layout
 
-The tree follows `Norma-Repositorios.md` Anexo A (Flyway). Every family folder exists from day one,
-even when empty (`.gitkeep`), so execution order never has to be renumbered.
+The tree is the team's layout convention for every `-db` repository: one folder per kind of change
+(structure, data, privileges, transaction control) plus one for the rollbacks. Flyway orders
+migrations by version number, never by path, so the folders only group files by purpose and keep
+each review scoped to one concern. Every family folder exists from day one, even when empty
+(`.gitkeep`), so the layout never has to be renamed or renumbered when a family is first used.
 
 | Folder | Content | Run by |
 |---|---|---|
@@ -182,7 +185,7 @@ It proves, in order:
    starts with its column.
 6. **Rollbacks** apply cleanly, highest version to lowest, and leave none of `auth_schema`,
    `auth_writer` or `auth_reader` behind.
-7. **Rebuild:** after dropping `flyway_schema_history`, migrating from scratch succeeds again.
+7. **Rebuild:** after dropping `auth_schema.flyway_schema_history`, migrating from scratch succeeds again.
 8. **Audit table (`AUTH-AUDIT-01`):** the steps named `AUTH-AUDIT-01` check that
    `user_creation_audit` has exactly its specified columns and constraints; that valid records are
    accepted and invalid actors, operations and missing fields are rejected; that its exact ACL is
@@ -201,12 +204,14 @@ To reproduce it by hand against the stand-in database above (bash, repository ro
 docker run --rm --network platform -e PGPASSWORD=dev_admin_pw postgres:16-alpine psql -h synkro-db -U postgres -d synkro -tAc "SELECT has_schema_privilege('auth_app', 'auth_schema', 'USAGE');"
 ```
 
+The history table lives in `auth_schema`, so drop it before the rollbacks, as CI does:
+
 ```bash
-find 05_rollbacks -name 'U*.sql' -printf '%f\t%p\n' | sort -r | cut -f2 | while read -r f; do echo "Applying $f"; docker exec -i synkro-db psql -U postgres -d synkro -v ON_ERROR_STOP=1 < "$f" || break; done
+docker exec synkro-db psql -U postgres -d synkro -c "DROP TABLE IF EXISTS auth_schema.flyway_schema_history;"
 ```
 
 ```bash
-docker exec synkro-db psql -U postgres -d synkro -c "DROP TABLE IF EXISTS flyway_schema_history;"
+find 05_rollbacks -name 'U*.sql' -printf '%f\t%p\n' | sort -r | cut -f2 | while read -r f; do echo "Applying $f"; docker exec -i synkro-db psql -U postgres -d synkro -v ON_ERROR_STOP=1 < "$f" || break; done
 ```
 
 Then migrate again (step 3 above). The first command must print `t`; the loop must apply `U017`
