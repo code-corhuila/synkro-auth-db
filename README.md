@@ -52,6 +52,21 @@ Rules every new migration follows:
   from the environment. The runner uses the instance administrator's credentials (ADR-012).
 - `auth_app` (the login role) is created by `synkro-infra-postgres`'s bootstrap, not here.
   `V003` grants `auth_writer` to it, so **it must exist before the first migrate**.
+- **Name every constraint**: `pk_<table>`, `uq_<table>_<rule>`, `chk_<table>_<rule>`, `fk_<table>_<target>`.
+  The CI checks assert on these names. A closed set is a named `CHECK`, never an `ENUM`.
+- **Tables get their privileges from default privileges.** `V003` and `V005` use `ALTER DEFAULT
+  PRIVILEGES`, which covers only tables created by the role that ran them. The runner always
+  connects as the instance administrator, so every table is created by that same role; the CI
+  checks that a table's owner is the role that set those defaults.
+
+## Schema, tables and roles
+
+| Object | Created by | What it grants |
+|---|---|---|
+| `auth_schema` | `V001` | the schema of this domain |
+| `auth_writer` (`NOLOGIN`) | `V002` | `USAGE` on `auth_schema`; `SELECT`, `INSERT`, `UPDATE` on its tables, never `DELETE`. Granted to `auth_app`. |
+| `auth_reader` (`NOLOGIN`) | `V004` | `USAGE` on `auth_schema`; `SELECT` on its tables. Not granted to `auth_app`: no service reads through it yet. |
+| `auth_schema.system_user` | `V006` | the users of the system. `role` is `ADMIN`, `SALESPERSON` or `INVENTORY`; `SERVICE` is never a user role (ADR-006). No foreign keys. |
 
 ## Running the migrations locally
 
@@ -106,10 +121,15 @@ It proves, in order:
 1. **Migrate from empty** applies every `V*.sql` in the repository (the applied count is checked:
    Flyway exits 0 with zero migrations when it cannot find its config).
 2. **Migrate again** is a no-op (`No migration necessary`).
-3. **Privileges:** `auth_app` has `USAGE` on `auth_schema`.
-4. **Rollbacks** apply cleanly, highest version to lowest, and leave neither `auth_schema`
-   nor `auth_writer` behind.
-5. **Rebuild:** after dropping `flyway_schema_history`, migrating from scratch succeeds again.
+3. **Privileges:** `auth_app` has `USAGE` on `auth_schema`, and `SELECT`, `INSERT`, `UPDATE` on
+   `system_user` but not `DELETE`, which it inherits from `auth_writer`. `auth_reader` can read
+   `system_user` and cannot insert into it.
+4. **Constraints:** every CHECK, unique and NOT NULL rule of `system_user` rejects its bad rows with
+   the expected SQLSTATE and constraint (or column) name, and accepts the valid rows next to them.
+   The step deletes the rows it inserts.
+5. **Rollbacks** apply cleanly, highest version to lowest, and leave none of `auth_schema`,
+   `auth_writer` or `auth_reader` behind.
+6. **Rebuild:** after dropping `flyway_schema_history`, migrating from scratch succeeds again.
 
 To reproduce it by hand against the stand-in database above (bash, repository root):
 
@@ -125,11 +145,14 @@ find 05_rollbacks -name 'U*.sql' -printf '%f\t%p\n' | sort -r | cut -f2 | while 
 docker exec synkro-db psql -U postgres -d synkro -c "DROP TABLE IF EXISTS flyway_schema_history;"
 ```
 
-Then migrate again (step 3 above). The first command must print `t`; the loop must apply `U003`,
-`U002`, `U001` in that order without errors.
+Then migrate again (step 3 above). The first command must print `t`; the loop must apply `U006`
+down to `U001`, in that order, without errors.
 
 To run the whole workflow locally, unchanged, use [`act`](https://github.com/nektos/act):
 
 ```bash
 act push -W .github/workflows/db-ci.yml -P ubuntu-latest=catthehacker/ubuntu:act-latest
 ```
+
+The workflow's PostgreSQL service listens on host port 5432, so stop any PostgreSQL that already
+uses that port before running it.
