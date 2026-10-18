@@ -26,8 +26,11 @@ Full policy: `00-governance/branching-policy.md` in `synkro-docs`.
 
 ## Layout
 
-The tree follows `Norma-Repositorios.md` Anexo A (Flyway). Every family folder exists from day one,
-even when empty (`.gitkeep`), so execution order never has to be renumbered.
+The tree is the team's layout convention for every `-db` repository: one folder per kind of change
+(structure, data, privileges, transaction control) plus one for the rollbacks. Flyway orders
+migrations by version number, never by path, so the folders only group files by purpose and keep
+each review scoped to one concern. Every family folder exists from day one, even when empty
+(`.gitkeep`), so the layout never has to be renamed or renumbered when a family is first used.
 
 | Folder | Content | Run by |
 |---|---|---|
