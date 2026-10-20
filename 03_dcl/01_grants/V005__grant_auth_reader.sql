@@ -1,0 +1,3 @@
+GRANT USAGE ON SCHEMA auth_schema TO auth_reader;
+ALTER DEFAULT PRIVILEGES IN SCHEMA auth_schema
+  GRANT SELECT ON TABLES TO auth_reader;

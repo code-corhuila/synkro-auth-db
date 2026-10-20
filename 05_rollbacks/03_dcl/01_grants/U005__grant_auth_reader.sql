@@ -1,0 +1,3 @@
+ALTER DEFAULT PRIVILEGES IN SCHEMA auth_schema
+  REVOKE SELECT ON TABLES FROM auth_reader;
+REVOKE USAGE ON SCHEMA auth_schema FROM auth_reader;
