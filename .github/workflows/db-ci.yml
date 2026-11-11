@@ -899,6 +899,94 @@ jobs:
           expect_eq "the other-domain stand-in role is dropped" \
             "SELECT count(*) FROM pg_roles WHERE rolname = 'probe_other_domain_app';" 0
 
+      - name: AUTH-RESET-AUDIT-01 — password_reset_audit has the specified shape
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/password-reset-audit-checks.sh
+          check_shape
+
+      - name: AUTH-RESET-AUDIT-01 — password_reset_audit accepts valid records and rejects invalid ones
+        # Every rejection carries its SQLSTATE and the constraint or column it breaks, next
+        # to a valid control. Placeholder data only: no password or hash is ever stored here.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/password-reset-audit-checks.sh
+          check_rows
+
+      - name: AUTH-RESET-AUDIT-01 — password_reset_audit grants are append-only for every role
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/password-reset-audit-checks.sh
+          check_grants
+
+      - name: AUTH-RESET-AUDIT-01 — auth_app resets, revokes and audits in one unit through its own login and cannot change the record
+        # A second connection authenticated as auth_app itself, not SET ROLE from the
+        # administrator: what is proved here is what the service really holds.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+          PSQL_APP="env PGPASSWORD=ci_app_pw psql -h localhost -U auth_app -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/password-reset-audit-checks.sh
+          check_app_login
+
+      - name: AUTH-RESET-AUDIT-01 — a role of another domain cannot see or touch password_reset_audit
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+          PSQL_OTHER="env PGPASSWORD=ci_other_pw psql -h localhost -U probe_other_domain_reset_app -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/password-reset-audit-checks.sh
+          check_other_domain
+
+      - name: AUTH-RESET-RECEIPT-01 — password_reset_receipt and its cleanup function have the specified shape
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/password-reset-audit-checks.sh
+          check_receipt_shape
+
+      - name: AUTH-RESET-RECEIPT-01 — password_reset_receipt accepts bcrypt strings and rejects everything else
+        # Placeholder, bcrypt-shaped strings only: no password or real hash is ever stored here.
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/password-reset-audit-checks.sh
+          check_receipt_rows
+
+      - name: AUTH-RESET-RECEIPT-01 — only the Auth runtime can read or write a receipt; no reader, report or export can
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/password-reset-audit-checks.sh
+          check_receipt_grants
+
+      - name: AUTH-RESET-RECEIPT-01 — auth_app commits reset, revocation, audit and receipt together, and cannot change or remove a receipt
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+          PSQL_APP="env PGPASSWORD=ci_app_pw psql -h localhost -U auth_app -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/password-reset-audit-checks.sh
+          check_receipt_app_login
+
+      - name: AUTH-RESET-RECEIPT-01 — the bounded cleanup removes only expired receipts and keeps every audit record and key
+        run: |
+          set -euo pipefail
+          PSQL="psql -h localhost -U postgres -d postgres -q -v ON_ERROR_STOP=1"
+
+          source .github/scripts/password-reset-audit-checks.sh
+          check_receipt_cleanup
+
       - name: Privilege check — auth_app cannot DELETE from any table of auth_schema
         # Schema-wide: the query reads the ordinary tables of auth_schema from the catalog,
         # so a table added later is checked without editing this step. has_table_privilege
@@ -968,7 +1056,7 @@ jobs:
           [ "$missing" -eq 0 ] || exit 1
           echo "PASS: every V migration has its mirrored U rollback"
 
-      - name: AUTH-AUDIT-01 — the audit migrations roll back and reapply, and nothing earlier changes
+      - name: AUTH-AUDIT-01 — the audit and receipt migrations roll back and reapply, and nothing earlier changes
         # Pre-existing Auth data is seeded and fingerprinted before the audit migrations are
         # rolled back and applied again, together with the checksums Flyway recorded for the
         # migrations before them. Nothing may differ afterwards, and no record is invented
@@ -1006,9 +1094,11 @@ jobs:
             "SELECT count(*) FROM auth_schema.flyway_schema_history WHERE version::int <= $last_earlier_version AND checksum IS NOT NULL;" 13
 
           # Roll the audit migrations back, highest first, and let Flyway forget them
-          expect_eq "there are exactly four audit rollbacks, U014 to U017" \
-            "SELECT $(find 05_rollbacks -name 'U01[4-7]__*.sql' | wc -l);" 4
-          find 05_rollbacks -name 'U01[4-7]__*.sql' -printf '%f\t%p\n' | sort -r | cut -f2 | while read -r f; do
+          # U014 to U017 belong to user_creation_audit, U018 to U021 to password_reset_audit and U022 to U026 to
+          # password_reset_receipt and its cleanup function (HU-AUTH-19)
+          expect_eq "there are exactly thirteen audit and receipt rollbacks, U014 to U026" \
+            "SELECT $(find 05_rollbacks \( -name 'U01[4-9]__*.sql' -o -name 'U02[0-6]__*.sql' \) | wc -l);" 13
+          find 05_rollbacks \( -name 'U01[4-9]__*.sql' -o -name 'U02[0-6]__*.sql' \) -printf '%f\t%p\n' | sort -r | cut -f2 | while read -r f; do
             echo "Applying $f"
             $PSQL -f "$f"
           done
@@ -1018,6 +1108,16 @@ jobs:
             "SELECT to_regclass('auth_schema.user_creation_audit') IS NULL;" t
           expect_eq "idx_user_creation_audit_actor_user_id is gone after its rollbacks" \
             "SELECT to_regclass('auth_schema.idx_user_creation_audit_actor_user_id') IS NULL;" t
+          expect_eq "password_reset_audit is gone after its rollbacks" \
+            "SELECT to_regclass('auth_schema.password_reset_audit') IS NULL;" t
+          expect_eq "idx_password_reset_audit_target_user_id is gone after its rollbacks" \
+            "SELECT to_regclass('auth_schema.idx_password_reset_audit_target_user_id') IS NULL;" t
+          expect_eq "password_reset_receipt is gone after its rollbacks" \
+            "SELECT to_regclass('auth_schema.password_reset_receipt') IS NULL;" t
+          expect_eq "idx_password_reset_receipt_expires_at is gone after its rollbacks" \
+            "SELECT to_regclass('auth_schema.idx_password_reset_receipt_expires_at') IS NULL;" t
+          expect_eq "the cleanup function is gone after its rollback" \
+            "SELECT to_regprocedure('auth_schema.purge_expired_password_reset_receipts(integer)') IS NULL;" t
           expect_eq "the four earlier tables are still there" \
             "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'auth_schema' AND c.relkind = 'r' AND c.relname <> 'flyway_schema_history';" 4
           [ "$(fingerprint)" = "$fingerprint_before" ] || { echo "FAIL: the earlier data changed during the rollbacks"; exit 1; }
@@ -1026,8 +1126,8 @@ jobs:
           # Apply them again with the same Flyway the deployment uses
           output=$(flyway -configFiles=flyway.toml migrate)
           echo "$output"
-          echo "$output" | grep -q "Successfully applied 4 migrations" \
-            || { echo "FAIL: the four audit migrations were not reapplied"; exit 1; }
+          echo "$output" | grep -q "Successfully applied 13 migrations" \
+            || { echo "FAIL: the thirteen audit and receipt migrations were not reapplied"; exit 1; }
           output=$(flyway -configFiles=flyway.toml migrate)
           echo "$output" | grep -q "No migration necessary" \
             || { echo "FAIL: the migrate after the reapplication was not a no-op"; exit 1; }
@@ -1040,11 +1140,15 @@ jobs:
 
           expect_eq "no audit record is invented for the users that already existed" \
             "SELECT count(*) FROM auth_schema.user_creation_audit;" 0
+          expect_eq "no password reset is invented for the users that already existed" \
+            "SELECT count(*) FROM auth_schema.password_reset_audit;" 0
+          expect_eq "no password reset receipt is invented for the users that already existed" \
+            "SELECT count(*) FROM auth_schema.password_reset_receipt;" 0
           expect_eq "system_user gained no authorship column" \
             "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'auth_schema' AND table_name = 'system_user' AND column_name ~ '(created|creator|author)';" 0
-          expect_eq "auth_schema holds the four earlier tables and the audit table, no initialization-control table" \
+          expect_eq "auth_schema holds the four earlier tables, the two audit tables and the receipt, no initialization-control table" \
             "SELECT string_agg(c.relname, ', ' ORDER BY c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'auth_schema' AND c.relkind = 'r' AND c.relname <> 'flyway_schema_history';" \
-            "idempotency_key, refresh_token, service_token, system_user, user_creation_audit"
+            "idempotency_key, password_reset_audit, password_reset_receipt, refresh_token, service_token, system_user, user_creation_audit"
           expect_eq "the earlier tables keep their privileges: auth_app can still UPDATE system_user" \
             "SELECT has_table_privilege('auth_app', 'auth_schema.system_user', 'UPDATE');" t
 
