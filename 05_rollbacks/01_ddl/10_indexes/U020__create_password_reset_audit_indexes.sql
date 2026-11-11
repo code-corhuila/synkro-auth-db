@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS auth_schema.idx_password_reset_audit_target_user_id;

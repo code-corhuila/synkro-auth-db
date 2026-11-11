@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS auth_schema.idx_password_reset_receipt_expires_at;
