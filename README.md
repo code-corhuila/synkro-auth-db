@@ -193,7 +193,7 @@ clock; the cleanup only removes rows that no longer have any use, to keep the ve
 accumulating.
 
 ```sql
--- as the migration owner or an operator role granted DELETE on the receipt (never auth_app)
+-- as the migration owner (never auth_app); see the complete privilege requirements below
 SELECT auth_schema.purge_expired_password_reset_receipts();      -- at most 1000 receipts per call
 SELECT auth_schema.purge_expired_password_reset_receipts(5000);  -- at most 5000 (valid range 1 to 10000)
 ```
@@ -201,16 +201,20 @@ SELECT auth_schema.purge_expired_password_reset_receipts(5000);  -- at most 5000
 - **Scope.** It deletes **only receipts whose `expires_at` has passed**, oldest first, at most `batch_size` per call,
   and returns the number removed. It never prints a hash or any row. It never touches `password_reset_audit`, so
   every audit record and every consumed key stays and an old key keeps answering `422`.
-- **Who can run it.** It runs with the caller's own privileges (`SECURITY INVOKER`) and `EXECUTE` is revoked from
-  everyone, so the caller needs `DELETE` on the receipt, which only the migration owner has. `auth_app`,
+- **Who can run it.** It runs with the caller's own privileges (`SECURITY INVOKER`). The migration owner can run it.
+  A separately provisioned operator would need schema `USAGE`, function `EXECUTE`, and receipt-table `SELECT`,
+  `DELETE` and `UPDATE` (required by `FOR UPDATE SKIP LOCKED`). `DELETE` alone is insufficient. No such operator
+  role is created by these migrations. `auth_app`,
   `auth_writer`, `auth_reader` and other domains cannot run it or delete a receipt.
 - **Schedule: once a day.** Repeat the call until it returns less than the batch size. Check beforehand, without
   printing any value:
   `SELECT count(*) FROM auth_schema.password_reset_receipt WHERE expires_at <= clock_timestamp();`
-- **Responsible.** The operator of the shared PostgreSQL instance (Infra) runs it with the owner credentials from
-  the operations runbook, and the Auth DB maintainers (`CODEOWNERS`) own this procedure. Naming the person or the
-  scheduler entry that runs it is an operational decision of the project owner and must be recorded in the
-  runbook **before the receipt migrations are deployed**; this repository does not create it.
+- **Responsible.** Project owner **AsolanoT** is assigned the daily execution, verification and response to failures
+  in the persistent local installation (assignment confirmed on 2026-11-11). Use protected migration-owner
+  credentials, separate from the runtime account; Auth DB maintainers (`CODEOWNERS`) maintain the procedure.
+  The deployment procedure is in `synkro-docs/10-devops/local-setup.md`, section "AUTH-19 receipt cleanup".
+  This assignment does not install a scheduler. An automated executor and its schedule must be explicitly
+  configured and tested before claiming that daily execution is automated.
 - **No Worker, no automatic TTL.** There is no job, service or PostgreSQL TTL that deletes on its own. A missed
   run is an operational finding: rows stay stored longer, but replay validity is never extended.
 - **Race with a replay.** A replay admitted at its lookup may finish after the receipt is deleted; it is read-only,

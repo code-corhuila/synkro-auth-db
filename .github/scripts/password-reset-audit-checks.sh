@@ -518,6 +518,22 @@ check_receipt_cleanup() {
   expect_violation 22023 "batch_size" "SELECT $purge_name(NULL);"
   expect_eq "a refused call deleted nothing" "SELECT count(*) FROM $receipt_table;" 4
 
+  # SECURITY INVOKER also needs UPDATE for its FOR UPDATE lock. Exercise a non-owner, not a superuser.
+  # Each probe rolls back its temporary role and grants as well as any deleted row.
+  local operator_setup="BEGIN;
+    CREATE ROLE auth_receipt_cleanup_probe NOLOGIN;
+    GRANT USAGE ON SCHEMA auth_schema TO auth_receipt_cleanup_probe;
+    GRANT SELECT, DELETE ON $receipt_table TO auth_receipt_cleanup_probe;
+    GRANT EXECUTE ON FUNCTION $purge_function TO auth_receipt_cleanup_probe;"
+  expect_denied "operator cleanup without the row-lock UPDATE privilege" \
+    "$operator_setup SET LOCAL ROLE auth_receipt_cleanup_probe; SELECT $purge_name(1); ROLLBACK;"
+  expect_accepted "$operator_setup GRANT UPDATE ON $receipt_table TO auth_receipt_cleanup_probe;
+    SET LOCAL ROLE auth_receipt_cleanup_probe;
+    DO \$\$ BEGIN IF $purge_name(1) <> 1 THEN RAISE EXCEPTION 'operator cleanup deleted the wrong count'; END IF; END \$\$;
+    ROLLBACK;" "the documented operator privileges allow bounded cleanup"
+  expect_eq "the operator probes rolled back their receipts and role" \
+    "SELECT (SELECT count(*) FROM $receipt_table) || '|' || (SELECT count(*) FROM pg_roles WHERE rolname = 'auth_receipt_cleanup_probe');" "4|0"
+
   expect_eq "a batch of two removes two expired receipts and reports only a count" \
     "SELECT $purge_name(2);" 2
   expect_eq "one expired receipt and the valid one remain" \
